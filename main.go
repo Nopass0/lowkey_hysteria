@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,7 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
@@ -29,14 +27,13 @@ import (
 )
 
 // ---------------------------------------------------------
-// Config — loaded from .env at startup
+// Config
 // ---------------------------------------------------------
 
 var (
-	ListenAddr  string
-	Port        = 7000
-	BackendBase string // optional fallback HTTP API
-	ServerIP    string // auto-detected
+	ListenAddr string
+	Port       = 7000
+	ServerIP   string // auto-detected
 
 	db  *pgxpool.Pool
 	rdb *redis.Client
@@ -45,15 +42,14 @@ var (
 func loadConfig() {
 	_ = godotenv.Load()
 
-	ListenAddr  = getenv("LISTEN_ADDR", ":7000")
-	BackendBase = getenv("BACKEND_URL", "http://localhost:3001")
+	ListenAddr = getenv("LISTEN_ADDR", ":7000")
 
 	if addr, err := net.ResolveTCPAddr("tcp", ListenAddr); err == nil && addr.Port != 0 {
 		Port = addr.Port
 	}
 
 	ServerIP = detectPublicIP()
-	log.Printf("[Config] ListenAddr=%s | BackendURL=%s | PublicIP=%s", ListenAddr, BackendBase, ServerIP)
+	log.Printf("[Config] ListenAddr=%s | PublicIP=%s", ListenAddr, ServerIP)
 }
 
 func getenv(key, fallback string) string {
@@ -63,7 +59,7 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-// detectPublicIP tries several public IP services and returns the first result.
+// detectPublicIP tries several public IP services in order.
 func detectPublicIP() string {
 	services := []string{
 		"https://api.ipify.org",
@@ -81,8 +77,7 @@ func detectPublicIP() string {
 		n, _ := resp.Body.Read(buf[:])
 		resp.Body.Close()
 		if n > 0 {
-			ip := strings.TrimSpace(string(buf[:n]))
-			if ip != "" {
+			if ip := strings.TrimSpace(string(buf[:n])); ip != "" {
 				log.Printf("[Config] Public IP detected via %s: %s", svc, ip)
 				return ip
 			}
@@ -93,7 +88,7 @@ func detectPublicIP() string {
 }
 
 // ---------------------------------------------------------
-// Database initialisation
+// Database connections
 // ---------------------------------------------------------
 
 func initDB() {
@@ -119,6 +114,83 @@ func initRedis() {
 		log.Fatalf("[Redis] Ping failed: %v", err)
 	}
 	log.Println("[Redis] Connected ✓")
+}
+
+// ---------------------------------------------------------
+// Server registration & heartbeat — direct to PostgreSQL
+// ---------------------------------------------------------
+
+// serverId holds the UUID of this server row in vpn_servers.
+var serverId string
+
+// registerServerDB upserts this node into vpn_servers by (ip, port).
+// If a row with the same IP+port exists it is reused; otherwise a new row is created.
+// Retries forever until the DB is reachable.
+func registerServerDB() {
+	log.Println("[Server] Registering in vpn_servers via PostgreSQL...")
+	protocols := []string{"hysteria2"}
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		var id string
+		err := db.QueryRow(ctx, `
+			INSERT INTO vpn_servers (ip, port, "supportedProtocols", "serverType", status, "currentLoad", "lastSeenAt", "createdAt")
+			VALUES ($1, $2, $3, 'dedicated', 'online', 0, NOW(), NOW())
+			ON CONFLICT (ip, port)
+			DO UPDATE SET
+				status        = 'online',
+				"currentLoad" = 0,
+				"lastSeenAt"  = NOW()
+			RETURNING id
+		`, ServerIP, Port, protocols).Scan(&id)
+		cancel()
+
+		if err != nil {
+			log.Printf("[Server] Registration failed: %v — retrying in 10s...", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		serverId = id
+		log.Printf("[Server] Registered/updated as %s", serverId)
+		return
+	}
+}
+
+// startHeartbeatDB updates currentLoad and lastSeenAt every 30 seconds directly in PostgreSQL.
+func startHeartbeatDB() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		if serverId == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		n := loadCount()
+		_, err := db.Exec(ctx, `
+			UPDATE vpn_servers
+			SET "currentLoad" = $1, "lastSeenAt" = NOW(), status = 'online'
+			WHERE id = $2
+		`, n, serverId)
+		cancel()
+
+		if err != nil {
+			log.Printf("[Server] Heartbeat DB update failed: %v", err)
+		} else {
+			log.Printf("[Server] Heartbeat: load=%d", n)
+		}
+	}
+}
+
+// markServerOffline sets status = 'offline' on clean shutdown.
+func markServerOffline() {
+	if serverId == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = db.Exec(ctx, `UPDATE vpn_servers SET status='offline' WHERE id=$1`, serverId)
+	log.Println("[Server] Marked offline in DB.")
 }
 
 // ---------------------------------------------------------
@@ -178,13 +250,12 @@ type authResult struct {
 	reason string
 }
 
-// authenticateLoginPassword verifies login+password directly against PostgreSQL,
-// then checks subscription validity via the same DB.
+// authenticateLoginPassword verifies login+password against PostgreSQL,
+// then checks subscription validity.
 func authenticateLoginPassword(login, password string) authResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// ── Step 1: find user ──
 	var (
 		userId       string
 		passwordHash string
@@ -198,22 +269,17 @@ func authenticateLoginPassword(login, password string) authResult {
 	if err != nil {
 		return authResult{reason: fmt.Sprintf("user not found: %v", err)}
 	}
-
-	// ── Step 2: check ban ──
 	if isBanned {
 		return authResult{reason: "user is banned"}
 	}
-
-	// ── Step 3: verify password ──
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
 		return authResult{reason: "wrong password"}
 	}
 
-	// ── Step 4: check active subscription ──
 	return checkSubscription(ctx, userId)
 }
 
-// checkSubscription verifies user has an active subscription in the DB.
+// checkSubscription verifies the user has an active subscription.
 func checkSubscription(ctx context.Context, userId string) authResult {
 	var isLifetime bool
 	var activeUntil time.Time
@@ -224,25 +290,22 @@ func checkSubscription(ctx context.Context, userId string) authResult {
 		WHERE "userId" = $1
 	`, userId).Scan(&isLifetime, &activeUntil)
 	if err != nil {
-		return authResult{reason: "no active subscription found"}
+		return authResult{reason: "no subscription"}
 	}
-
 	if !isLifetime && time.Now().After(activeUntil) {
 		return authResult{reason: fmt.Sprintf("subscription expired at %s", activeUntil.Format(time.RFC3339))}
 	}
-
 	return authResult{ok: true, userId: userId}
 }
 
-// authenticateVpnToken verifies a pre-issued VPN token directly against DB.
+// authenticateVpnToken verifies a pre-issued VPN token using the DB and checks Redis blocklist.
 func authenticateVpnToken(token string) authResult {
-	// Check Redis blocklist cache first (fast path)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	blocked, _ := rdb.Exists(ctx, "token:blocklist:"+token).Result()
-	if blocked > 0 {
-		return authResult{reason: "token is revoked"}
+	// Redis blocklist fast-path
+	if n, _ := rdb.Exists(ctx, "token:blocklist:"+token).Result(); n > 0 {
+		return authResult{reason: "token revoked"}
 	}
 
 	var (
@@ -250,72 +313,24 @@ func authenticateVpnToken(token string) authResult {
 		expiresAt time.Time
 	)
 	err := db.QueryRow(ctx, `
-		SELECT vt."userId", vt."expiresAt"
-		FROM vpn_tokens vt
-		WHERE vt.token = $1
+		SELECT "userId", "expiresAt"
+		FROM vpn_tokens
+		WHERE token = $1
 	`, token).Scan(&userId, &expiresAt)
 	if err != nil {
 		return authResult{reason: "token not found"}
 	}
-
 	if time.Now().After(expiresAt) {
 		return authResult{reason: "token expired"}
 	}
 
-	// Verify subscription is still active
 	subCtx, subCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer subCancel()
 	return checkSubscription(subCtx, userId)
 }
 
 // ---------------------------------------------------------
-// Hysteria2 Authenticator
-//
-// Supports two auth string formats from the Hysteria2 client config:
-//   1. "login:password"  — verifies directly against PostgreSQL
-//   2. "<vpn-token>"     — verifies VPN token from DB
-// ---------------------------------------------------------
-
-type ApiAuthenticator struct{}
-
-func (a *ApiAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
-	// Fast path: session cache hit
-	if entry, hit := cache.get(auth); hit {
-		log.Printf("[Auth] Cache hit → user %s from %s", entry.userId, addr)
-		return true, entry.userId
-	}
-
-	var result authResult
-
-	if strings.Contains(auth, ":") {
-		// Format 1: login:password
-		parts := strings.SplitN(auth, ":", 2)
-		login, password := parts[0], parts[1]
-		log.Printf("[Auth] Login attempt for %q from %s", login, addr)
-		result = authenticateLoginPassword(login, password)
-	} else {
-		// Format 2: vpn-token
-		log.Printf("[Auth] VPN token auth from %s", addr)
-		result = authenticateVpnToken(auth)
-	}
-
-	if !result.ok {
-		log.Printf("[Auth] Rejected from %s: %s", addr, result.reason)
-		return false, ""
-	}
-
-	// Cache session for 5 minutes
-	cache.set(auth, sessionEntry{
-		userId:    result.userId,
-		expiresAt: time.Now().Add(5 * time.Minute),
-	})
-
-	log.Printf("[Auth] Accepted → user %s from %s", result.userId, addr)
-	return true, result.userId
-}
-
-// ---------------------------------------------------------
-// Active connection counter (reported to backend on heartbeat)
+// Active connection counter
 // ---------------------------------------------------------
 
 var connCount struct {
@@ -328,54 +343,44 @@ func decConn() { connCount.Lock(); connCount.n--; connCount.Unlock() }
 func loadCount() int { connCount.Lock(); defer connCount.Unlock(); return connCount.n }
 
 // ---------------------------------------------------------
-// Fallback: Register & Heartbeat via backend HTTP API
-// (works even when backend is down — server still authenticates via DB)
+// Hysteria2 Authenticator
+// Supports two auth string formats:
+//   1. "login:password"  — verified directly against PostgreSQL
+//   2. "<vpn-token>"     — verified via vpn_tokens table + Redis blocklist
 // ---------------------------------------------------------
 
-var serverId string
+type ApiAuthenticator struct{}
 
-func registerServer() {
-	log.Println("[Server] Registering with backend API...")
-	for {
-		reqBody, _ := json.Marshal(map[string]interface{}{
-			"ip":                 ServerIP,
-			"port":               Port,
-			"supportedProtocols": []string{"hysteria2"},
-			"serverType":         "dedicated",
-		})
-		resp, err := http.Post(BackendBase+"/servers/register", "application/json", bytes.NewBuffer(reqBody))
-		if err == nil {
-			var result map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
-				if sid, ok := result["serverId"].(string); ok {
-					serverId = sid
-					resp.Body.Close()
-					log.Printf("[Server] Registered as %s", serverId)
-					return
-				}
-			}
-			resp.Body.Close()
-		}
-		log.Printf("[Server] Registration failed: %v — retrying in 15s...", err)
-		time.Sleep(15 * time.Second)
+func (a *ApiAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
+	// Fast path: session cache
+	if entry, hit := cache.get(auth); hit {
+		log.Printf("[Auth] Cache hit → user %s from %s", entry.userId, addr)
+		return true, entry.userId
 	}
-}
 
-func startHeartbeat() {
-	ticker := time.NewTicker(30 * time.Second)
-	for range ticker.C {
-		if serverId == "" {
-			continue
-		}
-		reqBody, _ := json.Marshal(map[string]interface{}{
-			"serverId":    serverId,
-			"currentLoad": loadCount(),
-		})
-		_, err := http.Post(BackendBase+"/servers/heartbeat", "application/json", bytes.NewBuffer(reqBody))
-		if err != nil {
-			log.Printf("[Server] Heartbeat failed: %v", err)
-		}
+	var result authResult
+	if strings.Contains(auth, ":") {
+		parts := strings.SplitN(auth, ":", 2)
+		log.Printf("[Auth] Login attempt for %q from %s", parts[0], addr)
+		result = authenticateLoginPassword(parts[0], parts[1])
+	} else {
+		log.Printf("[Auth] VPN token auth from %s", addr)
+		result = authenticateVpnToken(auth)
 	}
+
+	if !result.ok {
+		log.Printf("[Auth] Rejected from %s: %s", addr, result.reason)
+		return false, ""
+	}
+
+	cache.set(auth, sessionEntry{
+		userId:    result.userId,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	})
+
+	incConn()
+	log.Printf("[Auth] Accepted → user %s from %s", result.userId, addr)
+	return true, result.userId
 }
 
 // ---------------------------------------------------------
@@ -387,7 +392,7 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	template := x509.Certificate{
+	tmpl := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{Organization: []string{"Lowkey VPN"}},
 		NotBefore:             time.Now(),
@@ -397,11 +402,11 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	privBytes, err := x509.MarshalECPrivateKey(priv)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -415,26 +420,28 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // ---------------------------------------------------------
 
 func main() {
-	log.Println("[Lowkey] Starting Hysteria2 VPN Server...")
+	log.Println("[Lowkey] Starting Hysteria2 VPN Server (standalone mode)...")
 
-	// 0. Load config + auto-detect public IP
+	// 1. Load config + detect public IP
 	loadConfig()
 
-	// 1. Connect directly to PostgreSQL and Redis
+	// 2. Connect to PostgreSQL and Redis
 	initDB()
 	initRedis()
+	defer db.Close()
+	defer markServerOffline()
 
-	// 2. Generate TLS cert
+	// 3. Register this server directly in PostgreSQL, then start heartbeat
+	registerServerDB()
+	go startHeartbeatDB()
+
+	// 4. Generate TLS cert
 	tlsCert, err := generateSelfSignedCert()
 	if err != nil {
 		log.Fatalf("Failed to generate TLS cert: %v", err)
 	}
 
-	// 3. Register in backend (non-blocking, retries in background)
-	go registerServer()
-	go startHeartbeat()
-
-	// 4. Listen UDP
+	// 5. Listen UDP
 	udpAddr, _ := net.ResolveUDPAddr("udp", ListenAddr)
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
@@ -442,7 +449,7 @@ func main() {
 	}
 	log.Printf("[Lowkey] Listening QUIC/UDP on %s", ListenAddr)
 
-	// 5. Configure & start Hysteria2
+	// 6. Configure & start Hysteria2
 	hyConfig := &server.Config{
 		Conn: udpConn,
 		TLSConfig: server.TLSConfig{
@@ -455,7 +462,7 @@ func main() {
 		log.Fatalf("Failed to create Hysteria2 server: %v", err)
 	}
 
-	log.Println("[Lowkey] Hysteria2 server ready — authentication via PostgreSQL ✓")
+	log.Println("[Lowkey] Ready — no backend dependency, auth via PostgreSQL ✓")
 	if err := s.Serve(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
