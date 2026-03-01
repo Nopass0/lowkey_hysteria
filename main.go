@@ -135,8 +135,8 @@ func registerServerDB() {
 
 		var id string
 		err := db.QueryRow(ctx, `
-			INSERT INTO vpn_servers (ip, port, "supportedProtocols", "serverType", status, "currentLoad", "lastSeenAt", "createdAt")
-			VALUES ($1, $2, $3, 'dedicated', 'online', 0, NOW(), NOW())
+			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", "lastSeenAt", "createdAt")
+			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, NOW(), NOW())
 			ON CONFLICT (ip, port)
 			DO UPDATE SET
 				status        = 'online',
