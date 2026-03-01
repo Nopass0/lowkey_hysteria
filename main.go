@@ -14,23 +14,82 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
+	"github.com/joho/godotenv"
 )
 
 // ---------------------------------------------------------
-// Config
+// Config — loaded from .env at startup
 // ---------------------------------------------------------
 
-const (
-	ListenAddr  = ":7000"
+var (
+	ListenAddr  string
 	Port        = 7000
-	BackendBase = "http://localhost:3001"
-	ServerIP    = "127.0.0.1" // Change to public IP in production
+	BackendBase string
+	ServerIP    string // auto-detected
 )
+
+func loadConfig() {
+	// Load .env if present (silently ignore if missing — env vars may be set directly)
+	_ = godotenv.Load()
+
+	ListenAddr = getenv("LISTEN_ADDR", ":7000")
+	BackendBase = getenv("BACKEND_URL", "http://localhost:3001")
+
+	// Derive Port from ListenAddr for heartbeat/registration
+	if addr, err := net.ResolveTCPAddr("tcp", ListenAddr); err == nil && addr.Port != 0 {
+		Port = addr.Port
+	}
+
+	// Auto-detect public IP from external services
+	ServerIP = detectPublicIP()
+
+	log.Printf("[Config] ListenAddr=%s | BackendURL=%s | PublicIP=%s", ListenAddr, BackendBase, ServerIP)
+}
+
+// detectPublicIP tries several public IP services in order and returns the first
+// successful result. Falls back to "127.0.0.1" if none respond.
+func detectPublicIP() string {
+	services := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+		"https://checkip.amazonaws.com",
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, svc := range services {
+		resp, err := client.Get(svc)
+		if err != nil {
+			continue
+		}
+		var buf [64]byte
+		n, _ := resp.Body.Read(buf[:])
+		resp.Body.Close()
+		if n > 0 {
+			ip := strings.TrimSpace(string(buf[:n]))
+			if ip != "" {
+				log.Printf("[Config] Public IP detected via %s: %s", svc, ip)
+				return ip
+			}
+		}
+	}
+
+	log.Println("[Config] WARNING: could not detect public IP, using 127.0.0.1")
+	return "127.0.0.1"
+}
+
+func getenv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return fallback
+}
 
 // ---------------------------------------------------------
 // Session cache — prevents repeated backend calls per connection
@@ -406,6 +465,9 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 
 func main() {
 	log.Println("[Lowkey] Starting Hysteria2 VPN Server...")
+
+	// 0. Load environment configuration
+	loadConfig()
 
 	// 1. Generate TLS Certificate
 	tlsCert, err := generateSelfSignedCert()

@@ -7,6 +7,7 @@ require github.com/apernet/hysteria/core/v2 v2.7.1
 require (
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
