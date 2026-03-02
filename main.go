@@ -213,7 +213,6 @@ func startHeartbeatDB() {
 // ---------------------------------------------------------
 
 type ClientHello struct {
-	_struct bool   `msgpack:",asArray"`
 	Auth    string `msgpack:"auth"`
 	Rx      uint64 `msgpack:"rx"`
 	Tx      uint64 `msgpack:"tx"`
@@ -221,12 +220,11 @@ type ClientHello struct {
 }
 
 type ServerHello struct {
-	_struct bool   `msgpack:",asArray"`
-	Ok      bool   `msgpack:"ok"`
-	Msg     string `msgpack:"msg"`
-	Id      uint32 `msgpack:"id"`
-	Rx      uint64 `msgpack:"rx"`
-	IP      string `msgpack:"ip"`
+	Ok  bool   `msgpack:"ok"`
+	Msg string `msgpack:"msg"`
+	Id  uint32 `msgpack:"id"`
+	Rx  uint64 `msgpack:"rx"`
+	IP  string `msgpack:"ip"`
 }
 
 type IPPool struct {
@@ -282,10 +280,10 @@ func handleQUICConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "closed")
 	log.Printf("[QUIC] New connection from %s", conn.RemoteAddr())
 
-	// 1. Handshake over a stream
+	// 1. Handshake over a stream (Bidirectional)
 	stream, err := conn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("[QUIC] Failed to accept stream: %v", err)
+		log.Printf("[Handshake] Failed to accept stream from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 	defer stream.Close()
@@ -293,8 +291,10 @@ func handleQUICConnection(conn *quic.Conn) {
 	var hello ClientHello
 	dec := msgpack.NewDecoder(stream)
 	if err := dec.Decode(&hello); err != nil {
+		log.Printf("[Handshake] Failed to decode ClientHello from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
+	log.Printf("[Handshake] Received ClientHello from %s (Auth: %s)", conn.RemoteAddr(), hello.Auth)
 
 	authRes := authenticateVpnToken(hello.Auth)
 	
