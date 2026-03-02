@@ -290,10 +290,15 @@ func handleQUICConnection(conn *quic.Conn) {
 	}
 	defer stream.Close()
 
+	// Peek at the first few bytes for debugging
+	fullBuf := make([]byte, 1024)
+	n, _ := stream.Read(fullBuf)
+	fullBuf = fullBuf[:n]
+	log.Printf("[Handshake] Received %d bytes from %s: %x", n, conn.RemoteAddr(), fullBuf)
+
 	var hello ClientHello
-	dec := msgpack.NewDecoder(stream)
-	if err := dec.Decode(&hello); err != nil {
-		log.Printf("[Handshake] Failed to decode ClientHello from %s: %v", conn.RemoteAddr(), err)
+	if err := msgpack.Unmarshal(fullBuf, &hello); err != nil {
+		log.Printf("[Handshake] Failed to decode ClientHello from %s: %v. Raw Hex: %x", conn.RemoteAddr(), err, fullBuf)
 		return
 	}
 	log.Printf("[Handshake] Received ClientHello from %s (Auth: %s)", conn.RemoteAddr(), hello.Auth)
