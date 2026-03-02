@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/quic-go/quic-go"
@@ -41,6 +42,8 @@ var (
 	db  *pgxpool.Pool
 	rdb *redis.Client
 
+	JWTSecret []byte
+
 	tunDev *water.Interface
 	clients = make(map[string]*quic.Conn)
 	clientsMu sync.RWMutex
@@ -49,7 +52,7 @@ var (
 func loadConfig() {
 	_ = godotenv.Load()
 
-	ListenAddr = getenv("LISTEN_ADDR", ":7000")
+	JWTSecret = []byte(getenv("JWT_SECRET", "default_secret_change_me"))
 
 	if addr, err := net.ResolveUDPAddr("udp", ListenAddr); err == nil && addr.Port != 0 {
 		Port = addr.Port
@@ -218,6 +221,10 @@ type ClientHello struct {
 	Auth    string `msgpack:"auth"`
 	Rx      uint64 `msgpack:"rx"`
 	Tx      uint64 `msgpack:"tx"`
+	DevID   string `msgpack:"devId"`
+	DevName string `msgpack:"devName"`
+	DevOS   string `msgpack:"devOS"`
+	Version string `msgpack:"ver"`
 	Padding []byte `msgpack:"padding"`
 }
 
@@ -307,7 +314,8 @@ func handleQUICConnection(conn *quic.Conn) {
 	}
 	log.Printf("[Handshake] Received ClientHello from %s (Auth: %s)", conn.RemoteAddr(), hello.Auth)
 
-	authRes := authenticateVpnToken(hello.Auth)
+	// 2. Auth & Register Device
+	authRes := authenticateAndRegister(hello, conn.RemoteAddr().String())
 	
 	// 2. Allocate VIP
 	var clientVIP string
@@ -363,39 +371,75 @@ func handleQUICConnection(conn *quic.Conn) {
 	}
 }
 
-func authenticateVpnToken(token string) authResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func verifyJWT(tokenStr string) (string, error) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return JWTSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return "", fmt.Errorf("invalid token")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("invalid claims")
+	}
+	userId, ok := claims["userId"].(string)
+	if !ok {
+		return "", fmt.Errorf("no userId in claims")
+	}
+	return userId, nil
+}
+
+func authenticateAndRegister(hello ClientHello, remoteAddr string) authResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if n, _ := rdb.Exists(ctx, "token:blocklist:"+token).Result(); n > 0 {
-		return authResult{reason: "token revoked"}
-	}
-
-	var (
-		userId    string
-		expiresAt time.Time
-	)
-	err := db.QueryRow(ctx, `
-		SELECT "userId", "expiresAt"
-		FROM vpn_tokens
-		WHERE token = $1
-	`, token).Scan(&userId, &expiresAt)
+	// 1. Resolve User (try JWT first, then vpn_tokens)
+	userId, err := verifyJWT(hello.Auth)
 	if err != nil {
-		return authResult{reason: "token not found"}
-	}
-	if time.Now().After(expiresAt) {
-		return authResult{reason: "token expired"}
+		// Fallback to vpn_tokens (legacy or dedicated tokens)
+		var vUserId string
+		var expiresAt time.Time
+		err = db.QueryRow(ctx, `SELECT "userId", "expiresAt" FROM vpn_tokens WHERE token = $1`, hello.Auth).Scan(&vUserId, &expiresAt)
+		if err != nil {
+			return authResult{reason: "unauthorized (invalid jwt or token)"}
+		}
+		if time.Now().After(expiresAt) {
+			return authResult{reason: "token expired"}
+		}
+		userId = vUserId
 	}
 
+	// 2. Register/Update Device
+	if hello.DevID != "" {
+		host, _, _ := net.SplitHostPort(remoteAddr)
+		_, err = db.Exec(ctx, `
+			INSERT INTO devices (id, "userId", name, os, version, "lastIp", "lastSeenAt")
+			VALUES ($1, $2, $3, $4, $5, $6, NOW())
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				os = EXCLUDED.os,
+				version = EXCLUDED.version,
+				"lastIp" = EXCLUDED."lastIp",
+				"lastSeenAt" = NOW()
+		`, hello.DevID, userId, hello.DevName, hello.DevOS, hello.Version, host)
+		if err != nil {
+			log.Printf("[DB] Failed to register device %s: %v", hello.DevID, err)
+		}
+	}
+
+	// 3. Check Account Status (Ban)
+	var isBanned bool
+	err = db.QueryRow(ctx, `SELECT "isBanned" FROM users WHERE id = $1`, userId).Scan(&isBanned)
+	if err != nil || isBanned {
+		return authResult{reason: "user banned or not found"}
+	}
+
+	// 4. Check Subscription
 	var isLifetime bool
 	var activeUntil time.Time
-	err = db.QueryRow(ctx, `
-		SELECT "isLifetime", "activeUntil"
-		FROM subscriptions
-		WHERE "userId" = $1
-	`, userId).Scan(&isLifetime, &activeUntil)
+	err = db.QueryRow(ctx, `SELECT "isLifetime", "activeUntil" FROM subscriptions WHERE "userId" = $1`, userId).Scan(&isLifetime, &activeUntil)
 	if err != nil {
-		return authResult{reason: "no subscription"}
+		return authResult{reason: "no active subscription"}
 	}
 	if !isLifetime && time.Now().After(activeUntil) {
 		return authResult{reason: "subscription expired"}
