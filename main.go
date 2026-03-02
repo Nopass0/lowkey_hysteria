@@ -368,10 +368,15 @@ func handleQUICConnection(conn *quic.Conn) {
 	for {
 		data, err := conn.ReceiveDatagram(context.Background())
 		if err != nil {
+		    log.Printf("[QUIC -> TUN] Receive error from %s: %v", clientVIP, err)
 			break
 		}
 		if tunDev != nil {
-			_, _ = tunDev.Write(data)
+		    log.Printf("[QUIC -> TUN] Received packet size %d from %s", len(data), clientVIP)
+			_, err = tunDev.Write(data)
+			if err != nil {
+			    log.Printf("[QUIC -> TUN Error] Failed to write packet to TUN: %v", err)
+			}
 		}
 	}
 }
