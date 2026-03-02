@@ -52,9 +52,10 @@ var (
 func loadConfig() {
 	_ = godotenv.Load()
 
+	ListenAddr = getenv("LISTEN_ADDR", ":7000")
 	JWTSecret = []byte(getenv("JWT_SECRET", "default_secret_change_me"))
 
-	if addr, err := net.ResolveUDPAddr("udp", ListenAddr); err == nil && addr.Port != 0 {
+	if addr, err := net.ResolveUDPAddr("udp", ListenAddr); addr != nil && err == nil && addr.Port != 0 {
 		Port = addr.Port
 	}
 
