@@ -213,6 +213,7 @@ func startHeartbeatDB() {
 // ---------------------------------------------------------
 
 type ClientHello struct {
+	_struct bool   `msgpack:",asArray"`
 	Auth    string `msgpack:"auth"`
 	Rx      uint64 `msgpack:"rx"`
 	Tx      uint64 `msgpack:"tx"`
@@ -220,11 +221,12 @@ type ClientHello struct {
 }
 
 type ServerHello struct {
-	Ok  bool   `msgpack:"ok"`
-	Msg string `msgpack:"msg"`
-	Id  uint32 `msgpack:"id"`
-	Rx  uint64 `msgpack:"rx"`
-	IP  string `msgpack:"ip"`
+	_struct bool   `msgpack:",asArray"`
+	Ok      bool   `msgpack:"ok"`
+	Msg     string `msgpack:"msg"`
+	Id      uint32 `msgpack:"id"`
+	Rx      uint64 `msgpack:"rx"`
+	IP      string `msgpack:"ip"`
 }
 
 type IPPool struct {
@@ -314,10 +316,13 @@ func handleQUICConnection(conn *quic.Conn) {
 	}
 	if !authRes.ok {
 		resp.Msg = authRes.reason
+		log.Printf("[Auth] Handshake failed for %s: %s", conn.RemoteAddr(), authRes.reason)
 	}
 	_ = msgpack.NewEncoder(stream).Encode(resp)
 
 	if !authRes.ok {
+		// Give the client time to read the error before closing the whole connection
+		time.Sleep(200 * time.Millisecond)
 		return
 	}
 
