@@ -15,19 +15,21 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/quic-go/quic-go"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/songgao/water"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // ---------------------------------------------------------
-// Config
+// Config & Globals
 // ---------------------------------------------------------
 
 var (
@@ -37,6 +39,10 @@ var (
 
 	db  *pgxpool.Pool
 	rdb *redis.Client
+
+	tunDev *water.Interface
+	clients = make(map[string]*quic.Conn)
+	clientsMu sync.RWMutex
 )
 
 func loadConfig() {
@@ -44,7 +50,7 @@ func loadConfig() {
 
 	ListenAddr = getenv("LISTEN_ADDR", ":7000")
 
-	if addr, err := net.ResolveTCPAddr("tcp", ListenAddr); err == nil && addr.Port != 0 {
+	if addr, err := net.ResolveUDPAddr("udp", ListenAddr); err == nil && addr.Port != 0 {
 		Port = addr.Port
 	}
 
@@ -59,7 +65,6 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-// detectPublicIP tries several public IP services in order.
 func detectPublicIP() string {
 	services := []string{
 		"https://api.ipify.org",
@@ -83,12 +88,62 @@ func detectPublicIP() string {
 			}
 		}
 	}
-	log.Println("[Config] WARNING: could not detect public IP, using 127.0.0.1")
 	return "127.0.0.1"
 }
 
 // ---------------------------------------------------------
-// Database connections
+// TUN Interface & Management
+// ---------------------------------------------------------
+
+func initTUN() {
+	config := water.Config{
+		DeviceType: water.TUN,
+	}
+	
+	iface, err := water.New(config)
+	if err != nil {
+		log.Printf("[TUN] Failed to create TUN: %v. Running in auth-only mode.", err)
+		return
+	}
+	tunDev = iface
+	ifaceName := iface.Name()
+	log.Printf("[TUN] Created interface: %s", ifaceName)
+
+	// Bring UP and set IP (Linux specific)
+	_ = exec.Command("ip", "addr", "add", "172.20.0.1/24", "dev", ifaceName).Run()
+	_ = exec.Command("ip", "link", "set", ifaceName, "up").Run()
+
+	go forwardTUNToQUIC()
+}
+
+func forwardTUNToQUIC() {
+	buf := make([]byte, 2000)
+	for {
+		n, err := tunDev.Read(buf)
+		if err != nil {
+			log.Printf("[TUN] Read error: %v", err)
+			break
+		}
+		packet := buf[:n]
+		if len(packet) < 20 {
+			continue
+		}
+		
+		// Parse destination IP (simplistic IPv4 parser)
+		destIP := net.IP(packet[16:20]).String()
+		
+		clientsMu.RLock()
+		conn, ok := clients[destIP]
+		clientsMu.RUnlock()
+		
+		if ok {
+			_ = conn.SendDatagram(packet)
+		}
+	}
+}
+
+// ---------------------------------------------------------
+// Database & Redis
 // ---------------------------------------------------------
 
 func initDB() {
@@ -96,9 +151,6 @@ func initDB() {
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		log.Fatalf("[DB] Failed to connect to PostgreSQL: %v", err)
-	}
-	if err := pool.Ping(context.Background()); err != nil {
-		log.Fatalf("[DB] PostgreSQL ping failed: %v", err)
 	}
 	db = pool
 	log.Println("[DB] Connected to PostgreSQL ✓")
@@ -110,200 +162,195 @@ func initRedis() {
 		log.Fatalf("[Redis] Invalid REDIS_URL: %v", err)
 	}
 	rdb = redis.NewClient(opt)
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("[Redis] Ping failed: %v", err)
-	}
 	log.Println("[Redis] Connected ✓")
 }
 
 // ---------------------------------------------------------
-// Server registration & heartbeat — direct to PostgreSQL
+// Server Registration & Heartbeat
 // ---------------------------------------------------------
 
-// serverId holds the UUID of this server row in vpn_servers.
 var serverId string
 
-// registerServerDB upserts this node into vpn_servers by (ip, port).
-// If a row with the same IP+port exists it is reused; otherwise a new row is created.
-// Retries forever until the DB is reachable.
 func registerServerDB() {
-	log.Println("[Server] Registering in vpn_servers via PostgreSQL...")
 	protocols := []string{"hysteria2"}
-
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
 		var id string
 		err := db.QueryRow(ctx, `
 			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", "lastSeenAt", "createdAt")
 			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, NOW(), NOW())
 			ON CONFLICT (ip, port)
-			DO UPDATE SET
-				status        = 'online',
-				"currentLoad" = 0,
-				"lastSeenAt"  = NOW()
+			DO UPDATE SET status = 'online', "lastSeenAt" = NOW()
 			RETURNING id
 		`, ServerIP, Port, protocols).Scan(&id)
 		cancel()
 
-		if err != nil {
-			log.Printf("[Server] Registration failed: %v — retrying in 10s...", err)
-			time.Sleep(10 * time.Second)
-			continue
+		if err == nil {
+			serverId = id
+			log.Printf("[Server] Registered as %s", serverId)
+			return
 		}
-
-		serverId = id
-		log.Printf("[Server] Registered/updated as %s", serverId)
-		return
+		log.Printf("[Server] Registration failed: %v — retrying in 10s...", err)
+		time.Sleep(10 * time.Second)
 	}
 }
 
-// startHeartbeatDB updates currentLoad and lastSeenAt every 30 seconds directly in PostgreSQL.
 func startHeartbeatDB() {
-	ticker := time.NewTicker(30 * time.Second)
-	for range ticker.C {
+	for range time.Tick(30 * time.Second) {
 		if serverId == "" {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		n := loadCount()
-		_, err := db.Exec(ctx, `
-			UPDATE vpn_servers
-			SET "currentLoad" = $1, "lastSeenAt" = NOW(), status = 'online'
+		inc := loadCount()
+		_, _ = db.Exec(context.Background(), `
+			UPDATE vpn_servers SET "currentLoad" = $1, "lastSeenAt" = NOW(), status = 'online'
 			WHERE id = $2
-		`, n, serverId)
-		cancel()
-
-		if err != nil {
-			log.Printf("[Server] Heartbeat DB update failed: %v", err)
-		} else {
-			log.Printf("[Server] Heartbeat: load=%d", n)
-		}
+		`, inc, serverId)
 	}
 }
 
-// markServerOffline sets status = 'offline' on clean shutdown.
-func markServerOffline() {
-	if serverId == "" {
+// ---------------------------------------------------------
+// Native Hysteria2 Handshake
+// ---------------------------------------------------------
+
+type ClientHello struct {
+	Auth    string `msgpack:"auth"`
+	Rx      uint64 `msgpack:"rx"`
+	Tx      uint64 `msgpack:"tx"`
+	Padding []byte `msgpack:"padding"`
+}
+
+type ServerHello struct {
+	Ok  bool   `msgpack:"ok"`
+	Msg string `msgpack:"msg"`
+	Id  uint32 `msgpack:"id"`
+	Rx  uint64 `msgpack:"rx"`
+	IP  string `msgpack:"ip"`
+}
+
+type IPPool struct {
+	mu        sync.Mutex
+	available []string
+	used      map[string]bool
+}
+
+func newIPPool(subnet string) *IPPool {
+	p := &IPPool{
+		used: make(map[string]bool),
+	}
+	// Simplified: fill 172.20.0.2 - 172.20.0.254
+	for i := 2; i < 255; i++ {
+		p.available = append(p.available, fmt.Sprintf("172.20.0.%d", i))
+	}
+	return p
+}
+
+func (p *IPPool) Acquire() (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.available) == 0 {
+		return "", false
+	}
+	ip := p.available[0]
+	p.available = p.available[1:]
+	p.used[ip] = true
+	return ip, true
+}
+
+func (p *IPPool) Release(ip string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.used[ip] {
+		delete(p.used, ip)
+		p.available = append(p.available, ip)
+	}
+}
+
+var vips = newIPPool("172.20.0.0/24")
+
+var connCount struct {
+	sync.Mutex
+	n int
+}
+
+func incConn() { connCount.Lock(); connCount.n++; connCount.Unlock() }
+func decConn() { connCount.Lock(); connCount.n--; connCount.Unlock() }
+func loadCount() int { connCount.Lock(); defer connCount.Unlock(); return connCount.n }
+
+func handleQUICConnection(conn *quic.Conn) {
+	defer conn.CloseWithError(0, "closed")
+	log.Printf("[QUIC] New connection from %s", conn.RemoteAddr())
+
+	// 1. Handshake over a stream
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("[QUIC] Failed to accept stream: %v", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _ = db.Exec(ctx, `UPDATE vpn_servers SET status='offline' WHERE id=$1`, serverId)
-	log.Println("[Server] Marked offline in DB.")
-}
+	defer stream.Close()
 
-// ---------------------------------------------------------
-// Session cache — avoids repeated DB queries per packet
-// ---------------------------------------------------------
+	var hello ClientHello
+	dec := msgpack.NewDecoder(stream)
+	if err := dec.Decode(&hello); err != nil {
+		return
+	}
 
-type sessionEntry struct {
-	userId    string
-	expiresAt time.Time
-}
-
-type sessionCache struct {
-	mu    sync.RWMutex
-	store map[string]sessionEntry
-}
-
-var cache = &sessionCache{store: make(map[string]sessionEntry)}
-
-func init() {
-	go func() {
-		for range time.Tick(5 * time.Minute) {
-			now := time.Now()
-			cache.mu.Lock()
-			for k, v := range cache.store {
-				if now.After(v.expiresAt) {
-					delete(cache.store, k)
-				}
-			}
-			cache.mu.Unlock()
+	authRes := authenticateVpnToken(hello.Auth)
+	
+	// 2. Allocate VIP
+	var clientVIP string
+	if authRes.ok {
+		var ok bool
+		clientVIP, ok = vips.Acquire()
+		if !ok {
+			authRes.ok = false
+			authRes.reason = "ip pool exhausted"
 		}
+	}
+
+	resp := ServerHello{
+		Ok: authRes.ok, 
+		Id: 1,
+		IP: clientVIP,
+	}
+	if !authRes.ok {
+		resp.Msg = authRes.reason
+	}
+	_ = msgpack.NewEncoder(stream).Encode(resp)
+
+	if !authRes.ok {
+		return
+	}
+
+	// 3. Register for routing
+	clientsMu.Lock()
+	clients[clientVIP] = conn
+	clientsMu.Unlock()
+	defer func() {
+		clientsMu.Lock()
+		delete(clients, clientVIP)
+		clientsMu.Unlock()
+		vips.Release(clientVIP)
 	}()
+
+	incConn()
+	defer decConn()
+
+	// 4. Forward QUIC -> TUN
+	for {
+		data, err := conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			break
+		}
+		if tunDev != nil {
+			_, _ = tunDev.Write(data)
+		}
+	}
 }
 
-func (sc *sessionCache) get(key string) (sessionEntry, bool) {
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-	e, ok := sc.store[key]
-	if ok && time.Now().Before(e.expiresAt) {
-		return e, true
-	}
-	return sessionEntry{}, false
-}
-
-func (sc *sessionCache) set(key string, e sessionEntry) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	sc.store[key] = e
-}
-
-// ---------------------------------------------------------
-// Direct PostgreSQL authentication
-// ---------------------------------------------------------
-
-type authResult struct {
-	ok     bool
-	userId string
-	reason string
-}
-
-// authenticateLoginPassword verifies login+password against PostgreSQL,
-// then checks subscription validity.
-func authenticateLoginPassword(login, password string) authResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var (
-		userId       string
-		passwordHash string
-		isBanned     bool
-	)
-	err := db.QueryRow(ctx, `
-		SELECT id, "passwordHash", "isBanned"
-		FROM users
-		WHERE login = $1
-	`, login).Scan(&userId, &passwordHash, &isBanned)
-	if err != nil {
-		return authResult{reason: fmt.Sprintf("user not found: %v", err)}
-	}
-	if isBanned {
-		return authResult{reason: "user is banned"}
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
-		return authResult{reason: "wrong password"}
-	}
-
-	return checkSubscription(ctx, userId)
-}
-
-// checkSubscription verifies the user has an active subscription.
-func checkSubscription(ctx context.Context, userId string) authResult {
-	var isLifetime bool
-	var activeUntil time.Time
-
-	err := db.QueryRow(ctx, `
-		SELECT "isLifetime", "activeUntil"
-		FROM subscriptions
-		WHERE "userId" = $1
-	`, userId).Scan(&isLifetime, &activeUntil)
-	if err != nil {
-		return authResult{reason: "no subscription"}
-	}
-	if !isLifetime && time.Now().After(activeUntil) {
-		return authResult{reason: fmt.Sprintf("subscription expired at %s", activeUntil.Format(time.RFC3339))}
-	}
-	return authResult{ok: true, userId: userId}
-}
-
-// authenticateVpnToken verifies a pre-issued VPN token using the DB and checks Redis blocklist.
 func authenticateVpnToken(token string) authResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Redis blocklist fast-path
 	if n, _ := rdb.Exists(ctx, "token:blocklist:"+token).Result(); n > 0 {
 		return authResult{reason: "token revoked"}
 	}
@@ -324,67 +371,31 @@ func authenticateVpnToken(token string) authResult {
 		return authResult{reason: "token expired"}
 	}
 
-	subCtx, subCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer subCancel()
-	return checkSubscription(subCtx, userId)
+	var isLifetime bool
+	var activeUntil time.Time
+	err = db.QueryRow(ctx, `
+		SELECT "isLifetime", "activeUntil"
+		FROM subscriptions
+		WHERE "userId" = $1
+	`, userId).Scan(&isLifetime, &activeUntil)
+	if err != nil {
+		return authResult{reason: "no subscription"}
+	}
+	if !isLifetime && time.Now().After(activeUntil) {
+		return authResult{reason: "subscription expired"}
+	}
+
+	return authResult{ok: true, userId: userId}
+}
+
+type authResult struct {
+	ok     bool
+	userId string
+	reason string
 }
 
 // ---------------------------------------------------------
-// Active connection counter
-// ---------------------------------------------------------
-
-var connCount struct {
-	sync.Mutex
-	n int
-}
-
-func incConn() { connCount.Lock(); connCount.n++; connCount.Unlock() }
-func decConn() { connCount.Lock(); connCount.n--; connCount.Unlock() }
-func loadCount() int { connCount.Lock(); defer connCount.Unlock(); return connCount.n }
-
-// ---------------------------------------------------------
-// Hysteria2 Authenticator
-// Supports two auth string formats:
-//   1. "login:password"  — verified directly against PostgreSQL
-//   2. "<vpn-token>"     — verified via vpn_tokens table + Redis blocklist
-// ---------------------------------------------------------
-
-type ApiAuthenticator struct{}
-
-func (a *ApiAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
-	// Fast path: session cache
-	if entry, hit := cache.get(auth); hit {
-		log.Printf("[Auth] Cache hit → user %s from %s", entry.userId, addr)
-		return true, entry.userId
-	}
-
-	var result authResult
-	if strings.Contains(auth, ":") {
-		parts := strings.SplitN(auth, ":", 2)
-		log.Printf("[Auth] Login attempt for %q from %s", parts[0], addr)
-		result = authenticateLoginPassword(parts[0], parts[1])
-	} else {
-		log.Printf("[Auth] VPN token auth from %s", addr)
-		result = authenticateVpnToken(auth)
-	}
-
-	if !result.ok {
-		log.Printf("[Auth] Rejected from %s: %s", addr, result.reason)
-		return false, ""
-	}
-
-	cache.set(auth, sessionEntry{
-		userId:    result.userId,
-		expiresAt: time.Now().Add(5 * time.Minute),
-	})
-
-	incConn()
-	log.Printf("[Auth] Accepted → user %s from %s", result.userId, addr)
-	return true, result.userId
-}
-
-// ---------------------------------------------------------
-// Self-signed TLS certificate
+// TLS Helpers
 // ---------------------------------------------------------
 
 func generateSelfSignedCert() (tls.Certificate, error) {
@@ -393,14 +404,14 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Lowkey VPN"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"Lowkey VPN"}},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true,
+		IsCA: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
@@ -420,50 +431,44 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // ---------------------------------------------------------
 
 func main() {
-	log.Println("[Lowkey] Starting Hysteria2 VPN Server (standalone mode)...")
+	log.Println("[Lowkey] Starting Native Hysteria2 Server...")
 
-	// 1. Load config + detect public IP
 	loadConfig()
-
-	// 2. Connect to PostgreSQL and Redis
 	initDB()
 	initRedis()
-	defer db.Close()
-	defer markServerOffline()
-
-	// 3. Register this server directly in PostgreSQL, then start heartbeat
+	
+	initTUN() 
+	
 	registerServerDB()
 	go startHeartbeatDB()
 
-	// 4. Generate TLS cert
-	tlsCert, err := generateSelfSignedCert()
+	cert, err := generateSelfSignedCert()
 	if err != nil {
-		log.Fatalf("Failed to generate TLS cert: %v", err)
+		log.Fatalf("Failed to generate cert: %v", err)
 	}
 
-	// 5. Listen UDP
-	udpAddr, _ := net.ResolveUDPAddr("udp", ListenAddr)
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatalf("Failed to listen UDP on %s: %v", ListenAddr, err)
-	}
-	log.Printf("[Lowkey] Listening QUIC/UDP on %s", ListenAddr)
-
-	// 6. Configure & start Hysteria2
-	hyConfig := &server.Config{
-		Conn: udpConn,
-		TLSConfig: server.TLSConfig{
-			Certificates: []tls.Certificate{tlsCert},
-		},
-		Authenticator: &ApiAuthenticator{},
-	}
-	s, err := server.NewServer(hyConfig)
-	if err != nil {
-		log.Fatalf("Failed to create Hysteria2 server: %v", err)
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"lowkey-vpn"},
 	}
 
-	log.Println("[Lowkey] Ready — no backend dependency, auth via PostgreSQL ✓")
-	if err := s.Serve(); err != nil {
-		log.Fatalf("Server error: %v", err)
+	quicConf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: 10 * time.Second,
+	}
+
+	listener, err := quic.ListenAddr(ListenAddr, tlsConf, quicConf)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+	log.Printf("[Server] Listening on %s...", ListenAddr)
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			log.Printf("[Server] Accept failed: %v", err)
+			continue
+		}
+		go handleQUICConnection(conn)
 	}
 }
