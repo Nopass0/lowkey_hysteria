@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -290,11 +291,14 @@ func handleQUICConnection(conn *quic.Conn) {
 	}
 	defer stream.Close()
 
-	// Peek at the first few bytes for debugging
-	fullBuf := make([]byte, 1024)
-	n, _ := stream.Read(fullBuf)
-	fullBuf = fullBuf[:n]
-	log.Printf("[Handshake] Received %d bytes from %s: %x", n, conn.RemoteAddr(), fullBuf)
+	// Initial handshake size is small (Hysteria2 uses ~512-1024 max for hello)
+	buf := make([]byte, 1024)
+	n, err := stream.Read(buf)
+	if err != nil && err != io.EOF {
+		log.Printf("[Handshake] Read error from %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	fullBuf := buf[:n]
 
 	var hello ClientHello
 	if err := msgpack.Unmarshal(fullBuf, &hello); err != nil {
