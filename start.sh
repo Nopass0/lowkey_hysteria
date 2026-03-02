@@ -87,7 +87,7 @@ export PATH="/usr/local/go/bin:$PATH"
 go build -o "$BINARY" .
 info "Build complete → $BINARY"
 
-# ─── 4. Open firewall port (optional, needs sudo) ─────────────────────────────
+# ─── 4. Open firewall port & Setup NAT (optional, needs sudo) ───────────────────
 LISTEN_PORT=$(grep -E '^LISTEN_ADDR' "$ENV_FILE" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "7000")
 if command -v ufw &>/dev/null; then
     info "Opening UDP port ${LISTEN_PORT} in ufw..."
@@ -97,6 +97,19 @@ elif command -v firewall-cmd &>/dev/null; then
     sudo firewall-cmd --permanent --add-port="${LISTEN_PORT}/udp" &>/dev/null || true
     sudo firewall-cmd --reload &>/dev/null || true
 fi
+
+info "Enabling IP forwarding and NAT for VPN subnet..."
+sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+
+# Clean up existing rules to avoid duplicates on restart
+sudo iptables -t nat -D POSTROUTING -s 172.20.0.0/24 ! -d 172.20.0.0/24 -j MASQUERADE 2>/dev/null || true
+sudo iptables -D FORWARD -s 172.20.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+sudo iptables -D FORWARD -d 172.20.0.0/24 -j ACCEPT 2>/dev/null || true
+
+# Add Masquerade for VPN clients to access the internet
+sudo iptables -t nat -A POSTROUTING -s 172.20.0.0/24 ! -d 172.20.0.0/24 -j MASQUERADE
+sudo iptables -A FORWARD -s 172.20.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -d 172.20.0.0/24 -j ACCEPT
 
 # ─── 5. Run ───────────────────────────────────────────────────────────────────
 info "Starting Hysteria2 VPN server on :${LISTEN_PORT} ..."
