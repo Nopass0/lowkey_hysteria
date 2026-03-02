@@ -114,8 +114,9 @@ func initTUN() {
 	ifaceName := iface.Name()
 	log.Printf("[TUN] Created interface: %s", ifaceName)
 
-	// Bring UP and set IP (Linux specific)
+	// Bring UP and set IP/MTU (Linux specific)
 	_ = exec.Command("ip", "addr", "add", "172.20.0.1/24", "dev", ifaceName).Run()
+	_ = exec.Command("ip", "link", "set", "dev", ifaceName, "mtu", "1350").Run()
 	_ = exec.Command("ip", "link", "set", ifaceName, "up").Run()
 
 	go forwardTUNToQUIC()
@@ -142,7 +143,10 @@ func forwardTUNToQUIC() {
 		clientsMu.RUnlock()
 		
 		if ok {
-			_ = conn.SendDatagram(packet)
+			err := conn.SendDatagram(packet)
+			if err != nil {
+			    log.Printf("[TUN -> QUIC] Drop to %s (len %d): %v", destIP, len(packet), err)
+			}
 		}
 	}
 }
