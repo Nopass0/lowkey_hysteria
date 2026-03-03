@@ -44,13 +44,24 @@ func Init() {
 
 	// Configure the interface (Linux-specific iproute2 commands).
 	// 172.20.0.1/24 is the VPN subnet gateway.
-	_ = exec.Command("ip", "addr", "add", "172.20.0.1/24", "dev", name).Run()
-	_ = exec.Command("ip", "link", "set", "dev", name, "mtu", "1350").Run()
-	_ = exec.Command("ip", "link", "set", name, "up").Run()
+	if err := exec.Command("ip", "addr", "add", "172.20.0.1/24", "dev", name).Run(); err != nil {
+		log.Printf("[TUN] Error adding IP address: %v", err)
+	}
+	if err := exec.Command("ip", "link", "set", "dev", name, "mtu", "1350").Run(); err != nil {
+		log.Printf("[TUN] Error setting MTU: %v", err)
+	}
+	if err := exec.Command("ip", "link", "set", name, "up").Run(); err != nil {
+		log.Printf("[TUN] Error setting interface UP: %v", err)
+	}
 
 	// Enable NAT so VPN clients can reach the internet.
-	_ = exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.20.0.0/24", "-j", "MASQUERADE").Run()
-	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	// Note: Root privileges required.
+	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.20.0.0/24", "-j", "MASQUERADE").Run(); err != nil {
+		log.Printf("[TUN] Warning: iptables MASQUERADE failed: %v", err)
+	}
+	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
+		log.Printf("[TUN] Warning: sysctl ip_forward failed: %v", err)
+	}
 
 	// Start the TUN → QUIC forwarding goroutine.
 	go forwardTUNToQUIC()
