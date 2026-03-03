@@ -11,19 +11,21 @@ import (
 	"os/exec"
 	"sync"
 
-	"github.com/quic-go/quic-go"
 	"github.com/songgao/water"
 )
 
 // Device is the active TUN interface. Nil when running on non-Linux hosts.
 var Device *water.Interface
 
-// clients maps a virtual IP address (e.g. "172.20.0.2") to the QUIC
-// connection object for that client.
+// clients maps a virtual IP address (e.g. "172.20.0.2") to the UDP
+// address of that client.
 var (
-	clients   = make(map[string]*quic.Conn)
+	clients   = make(map[string]*net.UDPAddr)
 	clientsMu sync.RWMutex
 )
+
+// ServerConn is the shared UDP socket used to send packets back to clients.
+var ServerConn *net.UDPConn
 
 // Init creates and configures the TUN interface.
 // On non-Linux systems (or when privileges are missing) the TUN step is
@@ -54,14 +56,14 @@ func Init() {
 	go forwardTUNToQUIC()
 }
 
-// RegisterClient adds a client's virtual IP → QUIC connection mapping so that
+// RegisterClient adds a client's virtual IP → UDP Address mapping so that
 // packets from the internet can be routed back to the correct client.
 //
 // @param vip  - virtual IP assigned to the client (e.g. "172.20.0.5")
-// @param conn - the client's QUIC connection
-func RegisterClient(vip string, conn *quic.Conn) {
+// @param addr - the client's UDP address
+func RegisterClient(vip string, addr *net.UDPAddr) {
 	clientsMu.Lock()
-	clients[vip] = conn
+	clients[vip] = addr
 	clientsMu.Unlock()
 }
 
@@ -75,7 +77,7 @@ func UnregisterClient(vip string) {
 }
 
 // forwardTUNToQUIC reads raw IP packets from the TUN interface and routes
-// each packet to the QUIC connection of the destination IP, if known.
+// each packet to the UDP connection of the destination IP, if known.
 func forwardTUNToQUIC() {
 	buf := make([]byte, 2000)
 	for {
@@ -93,13 +95,13 @@ func forwardTUNToQUIC() {
 		destIP := net.IP(packet[16:20]).String()
 
 		clientsMu.RLock()
-		conn, ok := clients[destIP]
+		addr, ok := clients[destIP]
 		clientsMu.RUnlock()
 
-		if ok {
-			// Send via QUIC Datagram (unreliable, low-latency channel).
-			if err = conn.SendDatagram(packet); err != nil {
-				log.Printf("[TUN→QUIC] Send error to %s: %v", destIP, err)
+		if ok && ServerConn != nil {
+			// Send via UDP.
+			if _, err = ServerConn.WriteToUDP(packet, addr); err != nil {
+				log.Printf("[TUN→UDP] Send error to %s: %v", destIP, err)
 			}
 		}
 	}

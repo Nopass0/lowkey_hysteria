@@ -1,25 +1,14 @@
-// Package vpn implements the native Hysteria2 QUIC server that handles client
-// connections, performs authentication, assigns virtual IPs, and manages the
-// packet forwarding lifecycle for each session.
+// Package vpn implements a lightweight UDP VPN server that handles client
+// connections, performs authentication via MessagePack ClientHello, assigns
+// virtual IPs, and manages the packet forwarding lifecycle for each session.
 package vpn
 
 import (
-	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"fmt"
-	"io"
 	"log"
-	"math/big"
+	"net"
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"hysteria_server/auth"
@@ -28,9 +17,9 @@ import (
 	"hysteria_server/tun"
 )
 
-// ─── Hysteria2 wire protocol structures ──────────────────────────────────────
+// ─── Wire protocol structures ────────────────────────────────────────────────
 
-// ClientHello is the first message sent by the client after the QUIC handshake.
+// ClientHello is the first message sent by the client.
 // It carries the JWT auth token plus optional device metadata.
 type ClientHello struct {
 	_msgpack struct{} `msgpack:",asArray"`
@@ -42,16 +31,6 @@ type ClientHello struct {
 	DevOS    string   `msgpack:"devOS"`   // operating system
 	Version  string   `msgpack:"ver"`     // client version string
 	Padding  []byte   `msgpack:"padding"` // random padding (anti-fingerprinting)
-}
-
-// ServerHello is the server's reply to a ClientHello.
-type ServerHello struct {
-	_msgpack struct{} `msgpack:",asArray"`
-	Ok       bool     `msgpack:"ok"`  // true = accepted
-	Msg      string   `msgpack:"msg"` // error reason when Ok=false
-	Id       uint32   `msgpack:"id"`  // session ID (reserved)
-	Rx       uint64   `msgpack:"rx"`  // server's receive limit
-	IP       string   `msgpack:"ip"`  // assigned virtual IP for the client
 }
 
 // ─── Virtual IP pool ─────────────────────────────────────────────────────────
@@ -67,7 +46,12 @@ type ipPool struct {
 func newIPPool() *ipPool {
 	p := &ipPool{used: make(map[string]bool)}
 	for i := 2; i < 255; i++ {
-		p.available = append(p.available, fmt.Sprintf("172.20.0.%d", i))
+		p.available = append(p.available, "172.20.0."+string(rune(i))) // optimization avoided for clarity
+	}
+	// proper init
+	p.available = make([]string, 0, 253)
+	for i := 2; i < 255; i++ {
+		p.available = append(p.available, net.IPv4(172, 20, 0, byte(i)).String())
 	}
 	return p
 }
@@ -99,8 +83,7 @@ var vips = newIPPool()
 
 // ─── Connection counter (used for heartbeat / load reporting) ─────────────
 
-// connCounter tracks the number of currently active QUIC connections so the
-// heartbeat goroutine can report an accurate currentLoad to the database.
+// connCounter tracks the number of currently active connections.
 var connCounter struct {
 	sync.Mutex
 	n int
@@ -115,158 +98,106 @@ func DecConn() { connCounter.Lock(); connCounter.n--; connCounter.Unlock() }
 // LoadCount returns the current number of active connections.
 func LoadCount() int { connCounter.Lock(); defer connCounter.Unlock(); return connCounter.n }
 
-// ─── TLS helpers ─────────────────────────────────────────────────────────────
+// ─── session map ─────────────────────────────────────────────────────────────
 
-// GenerateSelfSignedCert creates an in-memory self-signed TLS certificate for
-// the QUIC listener. Using a self-signed cert is acceptable here because VPN
-// clients pin the server by public key or disable certificate verification.
-//
-// @returns tls.Certificate, error
-func GenerateSelfSignedCert() (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
-	}
-	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Lowkey VPN"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create cert: %w", err)
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	privBytes, err := x509.MarshalECPrivateKey(priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("marshal key: %w", err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
-	return tls.X509KeyPair(certPEM, keyPEM)
+type session struct {
+	addr     *net.UDPAddr
+	vip      string
+	userID   string
+	lastSeen time.Time
 }
+
+var (
+	sessions   = make(map[string]*session) // key is udpAddr.String()
+	sessionsMu sync.RWMutex
+)
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
-// ListenAndServe starts the QUIC listener on cfg.ListenAddr and handles
-// incoming Hysteria2 connections. This call blocks until the process exits.
+// ListenAndServe starts the UDP listener on cfg.ListenAddr and handles
+// incoming connections. This call blocks until the process exits.
 //
 // @param cfg - application configuration
 func ListenAndServe(cfg *config.Config) {
-	cert, err := GenerateSelfSignedCert()
+	addr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	if err != nil {
-		log.Fatalf("[VPN] TLS cert: %v", err)
+		log.Fatalf("[VPN] ResolveUDPAddr error: %v", err)
 	}
 
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"lowkey-vpn"},
-	}
-	quicConf := &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: 10 * time.Second,
-	}
-
-	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConf, quicConf)
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		log.Fatalf("[VPN] Failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
-	log.Printf("[VPN] Listening on %s (Hysteria2/QUIC) ✓", cfg.ListenAddr)
+	
+	tun.ServerConn = conn
+	defer conn.Close()
 
+	log.Printf("[VPN] Listening on %s (UDP/Hysteria2-lite) ✓", cfg.ListenAddr)
+
+	buf := make([]byte, 65535)
 	for {
-		conn, err := listener.Accept(context.Background())
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[VPN] Accept error: %v", err)
+			log.Printf("[VPN] ReadFromUDP error: %v", err)
 			continue
 		}
-		go handleConnection(conn, cfg)
+
+		handlePacket(conn, remoteAddr, buf[:n], cfg)
 	}
 }
 
-// handleConnection manages the full lifecycle of a single client QUIC session:
-// handshake → auth → IP allocation → packet forwarding → cleanup.
-func handleConnection(conn *quic.Conn, cfg *config.Config) {
-	defer conn.CloseWithError(0, "closed")
-	log.Printf("[VPN] New connection from %s", conn.RemoteAddr())
+func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte, cfg *config.Config) {
+	addrStr := remoteAddr.String()
 
-	// Step 1: Read ClientHello over the first bidirectional stream.
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		log.Printf("[VPN] AcceptStream error from %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	defer stream.Close()
+	sessionsMu.RLock()
+	sess, exists := sessions[addrStr]
+	sessionsMu.RUnlock()
 
-	buf := make([]byte, 2048)
-	n, err := stream.Read(buf)
-	if err != nil && err != io.EOF {
-		log.Printf("[VPN] Read ClientHello error: %v", err)
-		return
-	}
+	// If no session exists, we expect a ClientHello msgpack
+	if !exists {
+		var hello ClientHello
+		if err := msgpack.Unmarshal(data, &hello); err != nil {
+			log.Printf("[VPN] Unknown/Invalid Auth packet from %s (len: %d)", addrStr, len(data))
+			return
+		}
 
-	var hello ClientHello
-	if err = msgpack.Unmarshal(buf[:n], &hello); err != nil {
-		log.Printf("[VPN] Unmarshal ClientHello error: %v", err)
-		return
-	}
-	log.Printf("[VPN] ClientHello from %s (dev=%s, os=%s)", conn.RemoteAddr(), hello.DevName, hello.DevOS)
+		authRes := auth.AuthenticateAndRegister(db.Pool, hello.Auth, cfg.JWTSecret)
+		if !authRes.OK {
+			log.Printf("[VPN] Auth rejected for %s: %s", addrStr, authRes.Reason)
+			return
+		}
 
-	// Step 2: Authenticate.
-	result := auth.AuthenticateAndRegister(db.Pool, hello.Auth, cfg.JWTSecret)
-
-	// Step 3: Acquire virtual IP (only if auth succeeded).
-	var clientVIP string
-	if result.OK {
-		var ok bool
-		clientVIP, ok = vips.acquire()
+		clientVIP, ok := vips.acquire()
 		if !ok {
-			result.OK = false
-			result.Reason = "ip pool exhausted"
+			log.Printf("[VPN] IP pool exhausted for %s", addrStr)
+			return
 		}
-	}
 
-	// Step 4: Send ServerHello.
-	resp := ServerHello{Ok: result.OK, Id: 1, IP: clientVIP}
-	if !result.OK {
-		resp.Msg = result.Reason
-		log.Printf("[VPN] Auth rejected for %s: %s", conn.RemoteAddr(), result.Reason)
-	}
-	if encErr := msgpack.NewEncoder(stream).Encode(resp); encErr != nil {
-		log.Printf("[VPN] Encode ServerHello error: %v", encErr)
-	}
-	if !result.OK {
-		time.Sleep(200 * time.Millisecond)
+		sess = &session{
+			addr:     remoteAddr,
+			vip:      clientVIP,
+			userID:   authRes.UserID,
+			lastSeen: time.Now(),
+		}
+
+		sessionsMu.Lock()
+		sessions[addrStr] = sess
+		sessionsMu.Unlock()
+
+		tun.RegisterClient(clientVIP, remoteAddr)
+		IncConn()
+
+		log.Printf("[VPN] Session started for user=%s vip=%s from %s (dev=%s)", authRes.UserID, clientVIP, addrStr, hello.DevName)
 		return
 	}
 
-	// Step 5: Register in TUN routing table.
-	tun.RegisterClient(clientVIP, conn)
-	defer func() {
-		tun.UnregisterClient(clientVIP)
-		vips.release(clientVIP)
-	}()
+	// Update last seen
+	sess.lastSeen = time.Now()
 
-	IncConn()
-	defer DecConn()
-
-	log.Printf("[VPN] Session started for user=%s vip=%s", result.UserID, clientVIP)
-
-	// Step 6: Main receive loop — forward QUIC datagrams into the TUN device.
-	for {
-		data, err := conn.ReceiveDatagram(context.Background())
-		if err != nil {
-			log.Printf("[VPN] ReceiveDatagram error (vip=%s): %v", clientVIP, err)
-			break
-		}
-		if tun.Device != nil {
-			if _, werr := tun.Device.Write(data); werr != nil {
-				log.Printf("[VPN] TUN write error: %v", werr)
-			}
+	// Forward raw IP packet into TUN device
+	if tun.Device != nil && len(data) > 0 {
+		if _, werr := tun.Device.Write(data); werr != nil {
+			log.Printf("[VPN] TUN write error: %v", werr)
 		}
 	}
-	log.Printf("[VPN] Session ended for vip=%s", clientVIP)
 }
