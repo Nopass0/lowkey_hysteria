@@ -1,6 +1,6 @@
-// Package vpn implements a lightweight UDP VPN server that handles client
-// connections, performs authentication via MessagePack ClientHello, assigns
-// virtual IPs, and manages the packet forwarding lifecycle for each session.
+// Package vpn implements a lightweight HTTP/3 (QUIC-based) VPN server that
+// handles client connections via POST requests, performs authentication,
+// assigns virtual IPs, and manages the packet forwarding lifecycle.
 package vpn
 
 import (

@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"sync"
 
-	quic "github.com/quic-go/quic-go"
 	"github.com/songgao/water"
 )
 
@@ -21,7 +20,6 @@ var Device *water.Interface
 
 // clients maps a virtual IP address (e.g. "172.20.0.2") to the client connection.
 var (
-	quicClients   = make(map[string]quic.Connection)
 	udpClients    = make(map[string]*net.UDPAddr)
 	streamClients = make(map[string]io.Writer)
 	clientsMu     sync.RWMutex
@@ -70,12 +68,6 @@ func Init() {
 	go forwardTUNToQUIC()
 }
 
-// RegisterQUICClient adds a client's virtual IP → QUIC Connection mapping.
-func RegisterQUICClient(vip string, conn quic.Connection) {
-	clientsMu.Lock()
-	quicClients[vip] = conn
-	clientsMu.Unlock()
-}
 
 // RegisterStreamClient adds a client's virtual IP → io.Writer mapping (for HTTP/3).
 func RegisterStreamClient(vip string, w io.Writer) {
@@ -87,7 +79,6 @@ func RegisterStreamClient(vip string, w io.Writer) {
 // UnregisterClient removes the mapping for all protocol types.
 func UnregisterClient(vip string) {
 	clientsMu.Lock()
-	delete(quicClients, vip)
 	delete(udpClients, vip)
 	delete(streamClients, vip)
 	clientsMu.Unlock()
@@ -112,7 +103,6 @@ func forwardTUNToQUIC() {
 		destIP := net.IP(packet[16:20]).String()
 
 		clientsMu.RLock()
-		qConn, isQUIC := quicClients[destIP]
 		uAddr, isUDP  := udpClients[destIP]
 		sWriter, isStream := streamClients[destIP]
 		clientsMu.RUnlock()
@@ -121,11 +111,6 @@ func forwardTUNToQUIC() {
 			// Send via Stream (HTTP/3)
 			if _, err := sWriter.Write(packet); err != nil {
 				log.Printf("[TUN→Stream] Write error to %s: %v", destIP, err)
-			}
-		} else if isQUIC {
-			// Send via QUIC Datagram
-			if err := qConn.SendDatagram(packet); err != nil {
-				log.Printf("[TUN→QUIC] SendDatagram error to %s: %v", destIP, err)
 			}
 		} else if isUDP && ServerConn != nil {
 			// Fallback to UDP
