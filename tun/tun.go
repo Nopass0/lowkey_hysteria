@@ -6,25 +6,28 @@
 package tun
 
 import (
+	"io"
 	"log"
 	"net"
 	"os/exec"
 	"sync"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/songgao/water"
 )
 
 // Device is the active TUN interface. Nil when running on non-Linux hosts.
 var Device *water.Interface
 
-// clients maps a virtual IP address (e.g. "172.20.0.2") to the UDP
-// address of that client.
+// clients maps a virtual IP address (e.g. "172.20.0.2") to the client connection.
 var (
-	clients   = make(map[string]*net.UDPAddr)
-	clientsMu sync.RWMutex
+	quicClients   = make(map[string]quic.Connection)
+	udpClients    = make(map[string]*net.UDPAddr)
+	streamClients = make(map[string]io.Writer)
+	clientsMu     sync.RWMutex
 )
 
-// ServerConn is the shared UDP socket used to send packets back to clients.
+// ServerConn is the shared UDP socket (fallback).
 var ServerConn *net.UDPConn
 
 // Init creates and configures the TUN interface.
@@ -67,23 +70,26 @@ func Init() {
 	go forwardTUNToQUIC()
 }
 
-// RegisterClient adds a client's virtual IP → UDP Address mapping so that
-// packets from the internet can be routed back to the correct client.
-//
-// @param vip  - virtual IP assigned to the client (e.g. "172.20.0.5")
-// @param addr - the client's UDP address
-func RegisterClient(vip string, addr *net.UDPAddr) {
+// RegisterQUICClient adds a client's virtual IP → QUIC Connection mapping.
+func RegisterQUICClient(vip string, conn quic.Connection) {
 	clientsMu.Lock()
-	clients[vip] = addr
+	quicClients[vip] = conn
 	clientsMu.Unlock()
 }
 
-// UnregisterClient removes the mapping when a client disconnects.
-//
-// @param vip - virtual IP that was assigned to the client
+// RegisterStreamClient adds a client's virtual IP → io.Writer mapping (for HTTP/3).
+func RegisterStreamClient(vip string, w io.Writer) {
+	clientsMu.Lock()
+	streamClients[vip] = w
+	clientsMu.Unlock()
+}
+
+// UnregisterClient removes the mapping for all protocol types.
 func UnregisterClient(vip string) {
 	clientsMu.Lock()
-	delete(clients, vip)
+	delete(quicClients, vip)
+	delete(udpClients, vip)
+	delete(streamClients, vip)
 	clientsMu.Unlock()
 }
 
@@ -106,17 +112,24 @@ func forwardTUNToQUIC() {
 		destIP := net.IP(packet[16:20]).String()
 
 		clientsMu.RLock()
-		addr, ok := clients[destIP]
+		qConn, isQUIC := quicClients[destIP]
+		uAddr, isUDP  := udpClients[destIP]
+		sWriter, isStream := streamClients[destIP]
 		clientsMu.RUnlock()
 
-		if ok && ServerConn != nil {
-			// Log returning packets
-			src := net.IP(packet[12:16]).String()
-			dst := net.IP(packet[16:20]).String()
-			log.Printf("[TUN→UDP] Packet for %s: %s -> %s (%d bytes)", destIP, src, dst, len(packet))
-
-			// Send via UDP.
-			if _, err = ServerConn.WriteToUDP(packet, addr); err != nil {
+		if isStream {
+			// Send via Stream (HTTP/3)
+			if _, err := sWriter.Write(packet); err != nil {
+				log.Printf("[TUN→Stream] Write error to %s: %v", destIP, err)
+			}
+		} else if isQUIC {
+			// Send via QUIC Datagram
+			if err := qConn.SendDatagram(packet); err != nil {
+				log.Printf("[TUN→QUIC] SendDatagram error to %s: %v", destIP, err)
+			}
+		} else if isUDP && ServerConn != nil {
+			// Fallback to UDP
+			if _, err = ServerConn.WriteToUDP(packet, uAddr); err != nil {
 				log.Printf("[TUN→UDP] Send error to %s: %v", destIP, err)
 			}
 		}

@@ -4,11 +4,14 @@
 package vpn
 
 import (
+	"crypto/tls"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
-	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"hysteria_server/auth"
@@ -35,28 +38,20 @@ type ClientHello struct {
 
 // ─── Virtual IP pool ─────────────────────────────────────────────────────────
 
-// ipPool manages the allocation of virtual IP addresses within the VPN subnet.
 type ipPool struct {
 	mu        sync.Mutex
 	available []string
 	used      map[string]bool
 }
 
-// newIPPool pre-fills the pool with addresses 172.20.0.2 – 172.20.0.254.
 func newIPPool() *ipPool {
 	p := &ipPool{used: make(map[string]bool)}
-	for i := 2; i < 255; i++ {
-		p.available = append(p.available, "172.20.0."+string(rune(i))) // optimization avoided for clarity
-	}
-	// proper init
-	p.available = make([]string, 0, 253)
 	for i := 2; i < 255; i++ {
 		p.available = append(p.available, net.IPv4(172, 20, 0, byte(i)).String())
 	}
 	return p
 }
 
-// acquire returns the next free IP or ("", false) when the pool is exhausted.
 func (p *ipPool) acquire() (string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -69,7 +64,6 @@ func (p *ipPool) acquire() (string, bool) {
 	return ip, true
 }
 
-// release returns an IP back to the pool.
 func (p *ipPool) release(ip string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -81,128 +75,111 @@ func (p *ipPool) release(ip string) {
 
 var vips = newIPPool()
 
-// ─── Connection counter (used for heartbeat / load reporting) ─────────────
+// ─── Connection counter ──────────────────────────────────────────────────────
 
-// connCounter tracks the number of currently active connections.
 var connCounter struct {
 	sync.Mutex
 	n int
 }
 
-// IncConn increments the active connection counter.
 func IncConn() { connCounter.Lock(); connCounter.n++; connCounter.Unlock() }
-
-// DecConn decrements the active connection counter.
 func DecConn() { connCounter.Lock(); connCounter.n--; connCounter.Unlock() }
-
-// LoadCount returns the current number of active connections.
 func LoadCount() int { connCounter.Lock(); defer connCounter.Unlock(); return connCounter.n }
-
-// ─── session map ─────────────────────────────────────────────────────────────
-
-type session struct {
-	addr     *net.UDPAddr
-	vip      string
-	userID   string
-	lastSeen time.Time
-}
-
-var (
-	sessions   = make(map[string]*session) // key is udpAddr.String()
-	sessionsMu sync.RWMutex
-)
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
-// ListenAndServe starts the UDP listener on cfg.ListenAddr and handles
-// incoming connections. This call blocks until the process exits.
-//
-// @param cfg - application configuration
 func ListenAndServe(cfg *config.Config) {
-	addr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
+	cert, err := generateSelfSignedCert()
 	if err != nil {
-		log.Fatalf("[VPN] ResolveUDPAddr error: %v", err)
+		log.Fatalf("[VPN] TLS cert error: %v", err)
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		log.Fatalf("[VPN] Failed to listen on %s: %v", cfg.ListenAddr, err)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{http3.NextProtoH3},
 	}
-	
-	tun.ServerConn = conn
-	defer conn.Close()
 
-	log.Printf("[VPN] Listening on %s (UDP/Hysteria2-lite) ✓", cfg.ListenAddr)
+	handler := http.NewServeMux()
+	handler.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		handleTunnel(w, r, cfg)
+	})
 
-	buf := make([]byte, 65535)
-	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("[VPN] ReadFromUDP error: %v", err)
-			continue
-		}
+	server := http3.Server{
+		Addr:      cfg.ListenAddr,
+		Handler:   handler,
+		TLSConfig: tlsConfig,
+	}
 
-		handlePacket(conn, remoteAddr, buf[:n], cfg)
+	log.Printf("[VPN] HTTP/3 Server listening on %s ✓", cfg.ListenAddr)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("[VPN] HTTP/3 Server error: %v", err)
 	}
 }
 
-func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte, cfg *config.Config) {
-	addrStr := remoteAddr.String()
+func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+	addrStr := r.RemoteAddr
+	log.Printf("[VPN] New HTTP/3 tunnel request from %s", addrStr)
 
-	sessionsMu.RLock()
-	sess, exists := sessions[addrStr]
-	sessionsMu.RUnlock()
-
-	// If no session exists, we expect a ClientHello msgpack
-	if !exists {
-		var hello ClientHello
-		if err := msgpack.Unmarshal(data, &hello); err != nil {
-			log.Printf("[VPN] Unknown/Invalid Auth packet from %s (len: %d)", addrStr, len(data))
-			return
-		}
-
-		authRes := auth.AuthenticateAndRegister(db.Pool, hello.Auth, cfg.JWTSecret)
-		if !authRes.OK {
-			log.Printf("[VPN] Auth rejected for %s: %s", addrStr, authRes.Reason)
-			return
-		}
-
-		clientVIP, ok := vips.acquire()
-		if !ok {
-			log.Printf("[VPN] IP pool exhausted for %s", addrStr)
-			return
-		}
-
-		sess = &session{
-			addr:     remoteAddr,
-			vip:      clientVIP,
-			userID:   authRes.UserID,
-			lastSeen: time.Now(),
-		}
-
-		sessionsMu.Lock()
-		sessions[addrStr] = sess
-		sessionsMu.Unlock()
-
-		tun.RegisterClient(clientVIP, remoteAddr)
-		IncConn()
-
-		log.Printf("[VPN] Session started for user=%s vip=%s from %s (dev=%s)", authRes.UserID, clientVIP, addrStr, hello.DevName)
+	// 1. Read ClientHello from request body (first bytes)
+	decoder := msgpack.NewDecoder(r.Body)
+	var hello ClientHello
+	if err := decoder.Decode(&hello); err != nil {
+		log.Printf("[VPN] Auth decode error from %s: %v", addrStr, err)
+		http.Error(w, "invalid auth", http.StatusUnauthorized)
 		return
 	}
 
-	// Update last seen
-	sess.lastSeen = time.Now()
+	authRes := auth.AuthenticateAndRegister(db.Pool, hello.Auth, cfg.JWTSecret)
+	if !authRes.OK {
+		log.Printf("[VPN] Auth rejected for %s: %s", addrStr, authRes.Reason)
+		http.Error(w, "auth failed", http.StatusUnauthorized)
+		return
+	}
 
-	// Forward raw IP packet into TUN device
-	if tun.Device != nil && len(data) > 20 {
-		src := net.IP(data[12:16]).String()
-		dst := net.IP(data[16:20]).String()
-		// Only log if destination is not internal or just everything for debug
-		log.Printf("[UDP→TUN] Packet from %s: %s -> %s (%d bytes)", addrStr, src, dst, len(data))
+	clientVIP, ok := vips.acquire()
+	if !ok {
+		log.Printf("[VPN] IP pool exhausted for %s", addrStr)
+		http.Error(w, "no IPs", http.StatusServiceUnavailable)
+		return
+	}
+	defer vips.release(clientVIP)
 
-		if _, werr := tun.Device.Write(data); werr != nil {
-			log.Printf("[VPN] TUN write error: %v", werr)
+	// Set headers to indicate streaming response
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	
+	// Create a pipe for Tun -> Response
+	pr, pw := io.Pipe()
+	tun.RegisterStreamClient(clientVIP, pw)
+	defer tun.UnregisterClient(clientVIP)
+
+	IncConn()
+	defer DecConn()
+
+	log.Printf("[VPN] Tunnel established for vip=%s from %s", clientVIP, addrStr)
+
+	// Stream 1: TUN -> ResponseBody (Server to Client)
+	go func() {
+		_, _ = io.Copy(w, pr)
+	}()
+
+	// Stream 2: RequestBody -> TUN (Client to Server)
+	buf := make([]byte, 2048)
+	for {
+		n, err := r.Body.Read(buf)
+		if n > 0 {
+			if tun.Device != nil {
+				if _, werr := tun.Device.Write(buf[:n]); werr != nil {
+					log.Printf("[VPN] TUN write error: %v", werr)
+				}
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[VPN] Tunnel read error from %s: %v", addrStr, err)
+			}
+			break
 		}
 	}
+	log.Printf("[VPN] Tunnel closed for vip=%s", clientVIP)
 }
