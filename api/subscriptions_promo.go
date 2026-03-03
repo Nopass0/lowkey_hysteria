@@ -288,26 +288,30 @@ func applyEffect(ctx context.Context, tx pgx.Tx, userID string, ef promoEffect) 
 	switch ef.Key {
 	case "add_balance":
 		var amount float64
-		if fmt.Sscanf(ef.Value, "%f", &amount) == 1 && amount > 0 {
+		n, _ := fmt.Sscanf(ef.Value, "%f", &amount)
+		if n == 1 && amount > 0 {
 			tx.Exec(ctx, `UPDATE users SET balance=balance+$1 WHERE id=$2`, amount, userID) //nolint:errcheck
 			tx.Exec(ctx, `INSERT INTO transactions(id,"userId",type,amount,title,"createdAt") VALUES(gen_random_uuid(),$1,'promo_topup',$2,'Бонус по промокоду',NOW())`, userID, amount) //nolint:errcheck
 			return "+" + formatFloat(amount) + " ₽ на баланс"
 		}
 	case "plan_discount_pct":
 		var pct float64
-		if fmt.Sscanf(ef.Value, "%f", &pct) == 1 && pct > 0 {
+		n, _ := fmt.Sscanf(ef.Value, "%f", &pct)
+		if n == 1 && pct > 0 {
 			tx.Exec(ctx, `UPDATE users SET "pendingDiscountPct"=GREATEST("pendingDiscountPct",$1) WHERE id=$2`, pct, userID) //nolint:errcheck
 			return "Скидка " + formatFloat(pct) + "% на подписку"
 		}
 	case "plan_discount_fixed":
 		var amount float64
-		if fmt.Sscanf(ef.Value, "%f", &amount) == 1 && amount > 0 {
+		n, _ := fmt.Sscanf(ef.Value, "%f", &amount)
+		if n == 1 && amount > 0 {
 			tx.Exec(ctx, `UPDATE users SET "pendingDiscountFixed"="pendingDiscountFixed"+$1 WHERE id=$2`, amount, userID) //nolint:errcheck
 			return "Скидка " + formatFloat(amount) + " ₽ на подписку"
 		}
 	case "free_days":
 		var days int
-		if fmt.Sscanf(ef.Value, "%d", &days) == 1 && days > 0 {
+		n, _ := fmt.Sscanf(ef.Value, "%d", &days)
+		if n == 1 && days > 0 {
 			activeUntil := time.Now().Add(time.Duration(days) * 24 * time.Hour)
 			tx.Exec(ctx, `
 				INSERT INTO subscriptions(id,"userId","planId","planName","activeUntil","isLifetime","createdAt","updatedAt")
