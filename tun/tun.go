@@ -99,6 +99,11 @@ func forwardTUNToQUIC() {
 		clientsMu.RUnlock()
 
 		if ok && ServerConn != nil {
+			// Log returning packets
+			src := net.IP(packet[12:16]).String()
+			dst := net.IP(packet[16:20]).String()
+			log.Printf("[TUN→UDP] Packet for %s: %s -> %s (%d bytes)", destIP, src, dst, len(packet))
+
 			// Send via UDP.
 			if _, err = ServerConn.WriteToUDP(packet, addr); err != nil {
 				log.Printf("[TUN→UDP] Send error to %s: %v", destIP, err)

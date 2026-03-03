@@ -195,7 +195,12 @@ func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte, cfg *
 	sess.lastSeen = time.Now()
 
 	// Forward raw IP packet into TUN device
-	if tun.Device != nil && len(data) > 0 {
+	if tun.Device != nil && len(data) > 20 {
+		src := net.IP(data[12:16]).String()
+		dst := net.IP(data[16:20]).String()
+		// Only log if destination is not internal or just everything for debug
+		log.Printf("[UDP→TUN] Packet from %s: %s -> %s (%d bytes)", addrStr, src, dst, len(data))
+
 		if _, werr := tun.Device.Write(data); werr != nil {
 			log.Printf("[VPN] TUN write error: %v", werr)
 		}
