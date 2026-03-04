@@ -66,6 +66,9 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) http.Handler {
 		})
 	})
 
+	// ── Servers ──────────────────────────────────────────────────────────
+	mux.HandleFunc("GET /api/servers/list", h.getServers)
+
 	// ── Auth ─────────────────────────────────────────────────────────────
 	mux.HandleFunc("POST /api/auth/login",    h.login)
 	mux.HandleFunc("POST /api/auth/register", h.register)
