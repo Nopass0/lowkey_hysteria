@@ -66,6 +66,10 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) http.Handler {
 		})
 	})
 
+	// ── Auth ─────────────────────────────────────────────────────────────
+	mux.HandleFunc("POST /api/auth/login",    h.login)
+	mux.HandleFunc("POST /api/auth/register", h.register)
+
 	// ── User ─────────────────────────────────────────────────────────────
 	mux.Handle("GET /api/user/profile",      h.auth(http.HandlerFunc(h.getProfile)))
 	mux.Handle("GET /api/user/transactions", h.auth(http.HandlerFunc(h.getTransactions)))
