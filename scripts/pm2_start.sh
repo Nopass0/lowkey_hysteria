@@ -157,15 +157,15 @@ info "Enabling IP forwarding..."
 sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
 echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf >/dev/null 2>&1 || true
 
-info "Setting up NAT masquerade for VPN subnet 172.20.0.0/24..."
+info "Setting up NAT masquerade for VPN subnet 10.42.0.0/16..."
 # Remove stale rules (ignore errors if not present)
-sudo iptables -t nat -D POSTROUTING -s 172.20.0.0/24 ! -d 172.20.0.0/24 -j MASQUERADE 2>/dev/null || true
-sudo iptables -D FORWARD -s 172.20.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-sudo iptables -D FORWARD -d 172.20.0.0/24 -j ACCEPT 2>/dev/null || true
+sudo iptables -t nat -D POSTROUTING -s 10.42.0.0/16 ! -d 10.42.0.0/16 -j MASQUERADE 2>/dev/null || true
+sudo iptables -D FORWARD -s 10.42.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+sudo iptables -D FORWARD -d 10.42.0.0/16 -j ACCEPT 2>/dev/null || true
 # Add fresh rules
-sudo iptables -t nat -A POSTROUTING -s 172.20.0.0/24 ! -d 172.20.0.0/24 -j MASQUERADE
-sudo iptables -A FORWARD -s 172.20.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A FORWARD -d 172.20.0.0/24 -j ACCEPT
+sudo iptables -t nat -A POSTROUTING -s 10.42.0.0/16 ! -d 10.42.0.0/16 -j MASQUERADE
+sudo iptables -A FORWARD -s 10.42.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -d 10.42.0.0/16 -j ACCEPT
 info "NAT rules applied ✓"
 
 # ─── 6. Build Go binary ───────────────────────────────────────────────────────

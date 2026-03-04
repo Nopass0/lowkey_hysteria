@@ -38,6 +38,13 @@ if [ ! -f "$BINARY" ]; then
     echo "[start.sh] Сборка завершена ✓"
 fi
 
+# Включаем форвардинг и NAT (на всякий случай, если пузали не через pm2_start)
+echo "[start.sh] Настройка NAT для 10.42.0.0/16..."
+sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+sudo iptables -t nat -A POSTROUTING -s 10.42.0.0/16 ! -d 10.42.0.0/16 -j MASQUERADE || true
+sudo iptables -A FORWARD -s 10.42.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
+sudo iptables -A FORWARD -d 10.42.0.0/16 -j ACCEPT || true
+
 # Запускаем через nohup — процесс выживет после закрытия SSH
 cd "$SCRIPT_DIR/.."
 nohup "$BINARY" >> "$LOG_FILE" 2>&1 &
