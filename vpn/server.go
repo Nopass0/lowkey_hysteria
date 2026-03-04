@@ -146,6 +146,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 
 	// Set headers to indicate streaming response
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-VPN-IP", clientVIP)
 	w.WriteHeader(http.StatusOK)
 	
 	// Create a pipe for Tun -> Response
