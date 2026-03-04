@@ -22,7 +22,7 @@ func (h *handler) getServers(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	rows, err := h.db.Query(ctx, "SELECT id, ip, port, location, current_load, max_load, is_online FROM vpn_servers WHERE is_online = true")
+	rows, err := h.db.Query(ctx, `SELECT id, ip, port, location, "currentLoad", status FROM vpn_servers WHERE status = 'online'`)
 	if err != nil {
 		log.Printf("[API] Failed to fetch servers: %v", err)
 		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
@@ -33,9 +33,15 @@ func (h *handler) getServers(w http.ResponseWriter, r *http.Request) {
 	var servers []vpnServerResponse
 	for rows.Next() {
 		var s vpnServerResponse
-		if err := rows.Scan(&s.ID, &s.IP, &s.Port, &s.Location, &s.Load, &s.MaxLoad, &s.IsOnline); err != nil {
+		var status string
+		var load int
+		if err := rows.Scan(&s.ID, &s.IP, &s.Port, &s.Location, &load, &status); err != nil {
+			log.Printf("[API] Scan error: %v", err)
 			continue
 		}
+		s.Load = float64(load)
+		s.MaxLoad = 1000 // Mock max load
+		s.IsOnline = (status == "online")
 		s.LatencyMs = 25 // mock default ping 
 		servers = append(servers, s)
 	}
