@@ -10,6 +10,7 @@ package heartbeat
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -30,25 +31,26 @@ var serverID string
 // stores the resulting UUID in the package-level serverID variable.
 // It retries indefinitely until the operation succeeds.
 //
-// @param pool - PostgreSQL pool
-// @param cfg  - application configuration (PublicIP, Port)
-func RegisterServer(pool *pgxpool.Pool, cfg *config.Config) {
+// @param pool     - PostgreSQL pool
+// @param cfg      - application configuration (PublicIP, Port)
+// @param location - Human readable location (e.g. "Moscow, RU")
+func RegisterServer(pool *pgxpool.Pool, cfg *config.Config, location string) {
 	protocols := []string{"hysteria2"}
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var id string
 		err := pool.QueryRow(ctx, `
-			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", "lastSeenAt", "createdAt")
-			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, NOW(), NOW())
+			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", location, "lastSeenAt", "createdAt")
+			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, $4, NOW(), NOW())
 			ON CONFLICT (ip, port)
-			DO UPDATE SET status = 'online', "lastSeenAt" = NOW()
+			DO UPDATE SET status = 'online', location = EXCLUDED.location, "lastSeenAt" = NOW()
 			RETURNING id
-		`, cfg.PublicIP, cfg.Port, protocols).Scan(&id)
+		`, cfg.PublicIP, cfg.Port, protocols, location).Scan(&id)
 		cancel()
 
 		if err == nil {
 			serverID = id
-			log.Printf("[Heartbeat] Server registered in DB, ID=%s", serverID)
+			log.Printf("[Heartbeat] Server registered in DB, ID=%s, Loc=%s", serverID, location)
 			return
 		}
 		log.Printf("[Heartbeat] Registration failed: %v — retrying in 10s...", err)
@@ -141,4 +143,44 @@ func DetectPublicIP() string {
 	}
 	log.Println("[Heartbeat] Could not detect public IP — using 127.0.0.1")
 	return "127.0.0.1"
+}
+
+// DetectLocation queries ip-api.com to find the geographic location of the IP.
+// Useful for displaying servers in the app (e.g., "Moscow, RU").
+//
+// @param ip - the public IP address
+// @returns location string like "City, CC"
+func DetectLocation(ip string) string {
+	if ip == "127.0.0.1" || ip == "localhost" {
+		return "Local Test, UN"
+	}
+	url := "http://ip-api.com/json/" + ip + "?fields=status,countryCode,city"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("[Heartbeat] Geoloc IP error: %v", err)
+		return "Unknown, UN"
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "Unknown, UN"
+	}
+
+	var data struct {
+		Status      string `json:"status"`
+		City        string `json:"city"`
+		CountryCode string `json:"countryCode"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("[Heartbeat] Geoloc JSON error: %v", err)
+		return "Unknown, UN"
+	}
+
+	if data.Status != "success" || data.City == "" || data.CountryCode == "" {
+		return "Unknown, UN"
+	}
+
+	return data.City + ", " + data.CountryCode
 }

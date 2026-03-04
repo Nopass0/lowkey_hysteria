@@ -33,13 +33,15 @@ func main() {
 
 	// Detect and store public IP for server registration.
 	cfg.PublicIP = heartbeat.DetectPublicIP()
+	
+	locInfo := heartbeat.DetectLocation(cfg.PublicIP)
 
 	// ── 2. Connect to PostgreSQL and Redis ────────────────────────────────
 	db.InitDB(cfg)
 	db.InitRedis(cfg)
 
 	// ── 3. Register this server in the central DB and start heartbeat ─────
-	heartbeat.RegisterServer(db.Pool, cfg)
+	heartbeat.RegisterServer(db.Pool, cfg, locInfo)
 	heartbeat.StartHeartbeatDB(db.Pool)
 
 	// ── 4. Start the peer-server monitor (marks stale nodes offline) ──────
