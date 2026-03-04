@@ -157,16 +157,20 @@ info "Enabling IP forwarding..."
 sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
 echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf >/dev/null 2>&1 || true
 
-info "Setting up NAT masquerade for VPN subnet 10.42.0.0/16..."
-# Remove stale rules (ignore errors if not present)
+info "Setting up NAT masquerade and MSS clamping for VPN subnet 10.42.0.0/16..."
+# Remove stale rules
 sudo iptables -t nat -D POSTROUTING -s 10.42.0.0/16 ! -d 10.42.0.0/16 -j MASQUERADE 2>/dev/null || true
 sudo iptables -D FORWARD -s 10.42.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 sudo iptables -D FORWARD -d 10.42.0.0/16 -j ACCEPT 2>/dev/null || true
+sudo iptables -t mangle -D FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
 # Add fresh rules
 sudo iptables -t nat -A POSTROUTING -s 10.42.0.0/16 ! -d 10.42.0.0/16 -j MASQUERADE
 sudo iptables -A FORWARD -s 10.42.0.0/16 -m state --state RELATED,ESTABLISHED -j ACCEPT
 sudo iptables -A FORWARD -d 10.42.0.0/16 -j ACCEPT
-info "NAT rules applied ✓"
+# MSS Clamping is critical for UDP tunnels to prevent packet fragmentation issues
+sudo iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+info "NAT and MSS rules applied ✓"
 
 # ─── 6. Build Go binary ───────────────────────────────────────────────────────
 step "Building Go binary"
