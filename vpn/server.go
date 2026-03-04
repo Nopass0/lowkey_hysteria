@@ -136,17 +136,15 @@ func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 		return
 	}
 
-	clientVIP, ok := vips.acquire()
-	if !ok {
-		log.Printf("[VPN] IP pool exhausted for %s", addrStr)
-		http.Error(w, "no IPs", http.StatusServiceUnavailable)
+	clientVIP := r.Header.Get("X-Client-IP")
+	if clientVIP == "" {
+		log.Printf("[VPN] No X-Client-IP header from %s", addrStr)
+		http.Error(w, "missing unique IP", http.StatusBadRequest)
 		return
 	}
-	defer vips.release(clientVIP)
 
 	// Set headers to indicate streaming response
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-VPN-IP", clientVIP)
 	w.WriteHeader(http.StatusOK)
 	
 	// Create a pipe for Tun -> Response

@@ -44,8 +44,8 @@ func Init() {
 	log.Printf("[TUN] Interface created: %s", name)
 
 	// Configure the interface (Linux-specific iproute2 commands).
-	// 172.20.0.1/24 is the VPN subnet gateway.
-	if err := exec.Command("ip", "addr", "add", "172.20.0.1/24", "dev", name).Run(); err != nil {
+	// 10.0.0.1/8 is the VPN subnet gateway.
+	if err := exec.Command("ip", "addr", "add", "10.0.0.1/8", "dev", name).Run(); err != nil {
 		log.Printf("[TUN] Error adding IP address: %v", err)
 	}
 	if err := exec.Command("ip", "link", "set", "dev", name, "mtu", "1350").Run(); err != nil {
@@ -57,7 +57,7 @@ func Init() {
 
 	// Enable NAT so VPN clients can reach the internet.
 	// Note: Root privileges required.
-	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.20.0.0/24", "-j", "MASQUERADE").Run(); err != nil {
+	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.0.0.0/8", "-j", "MASQUERADE").Run(); err != nil {
 		log.Printf("[TUN] Warning: iptables MASQUERADE failed: %v", err)
 	}
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
