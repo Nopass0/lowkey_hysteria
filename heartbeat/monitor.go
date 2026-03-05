@@ -45,7 +45,7 @@ func RegisterServer(pool *pgxpool.Pool, cfg *config.Config, location string) {
 			ON CONFLICT (ip, port)
 			DO UPDATE SET status = 'online', location = EXCLUDED.location, "connectLinkTemplate" = EXCLUDED."connectLinkTemplate", "lastSeenAt" = NOW()
 			RETURNING id
-		`, cfg.PublicIP, cfg.Port, protocols, location, "vless://{uuid}@" + cfg.PublicIP + ":443?encryption=none&security=reality&sni=google.com&fp=chrome&pbk=BASE64_PUK&sid=SHORT_ID&type=tcp&headerType=none#lowkey-" + location).Scan(&id)
+		`, cfg.PublicIP, cfg.Port, protocols, location, "vless://{uuid}@" + cfg.PublicIP + ":443?encryption=none&security=reality&sni=google.com&fp=chrome&pbk=4kh0XQFo3wcPOnAU-o_Nokc3WQGWUVQEPQBurWHxUBM&sid=e12b6c973e573780&type=tcp&headerType=none#lowkey-" + location).Scan(&id)
 		cancel()
 
 		if err == nil {

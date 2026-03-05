@@ -48,9 +48,9 @@ const xrayConfigTmpl = `
           "serverNames": [
             "google.com"
           ],
-          "privateKey": "BASE64_PRK",
+          "privateKey": "97tkV3UQpZrSOQ2fPe1ZDGUc7Ew7Azibfkgtzc46To0",
           "shortIds": [
-            "SHORT_ID"
+            "e12b6c973e573780"
           ]
         }
       }
