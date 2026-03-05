@@ -68,6 +68,46 @@ install_go() {
 
 check_go
 
+# ─── 1.5. Check / install Xray ────────────────────────────────────────────────
+check_xray() {
+    if command -v xray &>/dev/null; then
+        info "Xray already installed: $(xray -version | head -n1 | grep -o '^Xray [0-9.]*')"
+        return 0
+    else
+        warn "Xray is NOT installed — installing..."
+    fi
+    install_xray
+}
+
+install_xray() {
+    info "Installing latest Xray-core..."
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="64" ;;
+        aarch64) arch="arm64-v8a" ;;
+        armv6l)  arch="arm32-v6a" ;;
+        *)        error "Unsupported architecture for Xray: $arch" ;;
+    esac
+
+    local zipball="Xray-linux-${arch}.zip"
+    local url="https://github.com/XTLS/Xray-core/releases/latest/download/${zipball}"
+
+    curl -fsSL -L "$url" -o "/tmp/${zipball}"
+    # Ensure unzip is installed
+    if ! command -v unzip &>/dev/null; then
+        sudo apt-get update -y && sudo apt-get install unzip -y || true
+    fi
+    
+    sudo unzip -o "/tmp/${zipball}" xray -d /usr/local/bin/
+    sudo chmod +x /usr/local/bin/xray
+    rm "/tmp/${zipball}"
+
+    info "Xray installed successfully."
+}
+
+check_xray
+
 # ─── 2. Set up .env ───────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
     if [[ -f "$REPO_DIR/.env.example" ]]; then
