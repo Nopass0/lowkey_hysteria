@@ -40,12 +40,12 @@ func RegisterServer(pool *pgxpool.Pool, cfg *config.Config, location string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var id string
 		err := pool.QueryRow(ctx, `
-			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", location, "lastSeenAt", "createdAt")
-			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, $4, NOW(), NOW())
+			INSERT INTO vpn_servers (id, ip, port, "supportedProtocols", "serverType", status, "currentLoad", location, "connectLinkTemplate", "lastSeenAt", "createdAt")
+			VALUES (gen_random_uuid(), $1, $2, $3, 'dedicated', 'online', 0, $4, $5, NOW(), NOW())
 			ON CONFLICT (ip, port)
-			DO UPDATE SET status = 'online', location = EXCLUDED.location, "lastSeenAt" = NOW()
+			DO UPDATE SET status = 'online', location = EXCLUDED.location, "connectLinkTemplate" = EXCLUDED."connectLinkTemplate", "lastSeenAt" = NOW()
 			RETURNING id
-		`, cfg.PublicIP, cfg.Port, protocols, location).Scan(&id)
+		`, cfg.PublicIP, cfg.Port, protocols, location, "vless://{uuid}@" + cfg.PublicIP + ":443?encryption=none&security=reality&sni=google.com&fp=chrome&pbk=BASE64_PUK&sid=SHORT_ID&type=tcp&headerType=none#lowkey-" + location).Scan(&id)
 		cancel()
 
 		if err == nil {

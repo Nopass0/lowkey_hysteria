@@ -13,14 +13,14 @@
 package main
 
 import (
-	"log"
-
 	"hysteria_server/api"
 	"hysteria_server/config"
 	"hysteria_server/db"
 	"hysteria_server/heartbeat"
 	"hysteria_server/tun"
 	"hysteria_server/vpn"
+	"hysteria_server/xray"
+	"log"
 )
 
 func main() {
@@ -54,6 +54,10 @@ func main() {
 	router := api.NewRouter(db.Pool, cfg)
 	go api.ListenAndServe(router, cfg.HTTPAddr)
 
-	// ── 7. Start the QUIC / Hysteria2 VPN server (blocks forever) ─────────
+	// ── 7. Start Xray User Sync goroutine ─────────────────────
+	// Assuming Xray VLESS listens on port 443 
+	go xray.SyncUsers(db.Pool, 443)
+
+	// ── 8. Start the QUIC / Hysteria2 VPN server (blocks forever) ─────────
 	vpn.ListenAndServe(cfg)
 }
