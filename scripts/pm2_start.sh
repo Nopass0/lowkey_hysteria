@@ -184,9 +184,10 @@ info "Build complete → $BINARY ✓"
 # ─── 7. Start / restart in PM2 ───────────────────────────────────────────────
 step "Starting server in PM2"
 
-if pm2 list | grep -q "$PM2_APP_NAME"; then
+# Check if process exists by name (exact match)
+if pm2 show "$PM2_APP_NAME" > /dev/null 2>&1; then
     info "Restarting existing PM2 process '$PM2_APP_NAME'..."
-    pm2 restart "$PM2_APP_NAME" --update-env
+    pm2 restart "$PM2_APP_NAME" --update-env || pm2 start "$BINARY" --name "$PM2_APP_NAME" --interpreter none --no-autorestart --env production
 else
     info "Starting '$PM2_APP_NAME' in PM2..."
     pm2 start "$BINARY" \
