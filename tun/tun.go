@@ -48,7 +48,7 @@ func Init() {
 	if err := exec.Command("ip", "addr", "add", "10.42.0.1/16", "dev", name).Run(); err != nil {
 		log.Printf("[TUN] Error adding IP address: %v", err)
 	}
-	if err := exec.Command("ip", "link", "set", "dev", name, "mtu", "1350").Run(); err != nil {
+	if err := exec.Command("ip", "link", "set", "dev", name, "mtu", "1280").Run(); err != nil {
 		log.Printf("[TUN] Error setting MTU: %v", err)
 	}
 	if err := exec.Command("ip", "link", "set", name, "up").Run(); err != nil {
@@ -59,6 +59,10 @@ func Init() {
 	// Note: Root privileges required.
 	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.42.0.0/16", "-j", "MASQUERADE").Run(); err != nil {
 		log.Printf("[TUN] Warning: iptables MASQUERADE failed: %v", err)
+	}
+	// MSS Clamping to prevent fragmentation on restricted networks.
+	if err := exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200").Run(); err != nil {
+		log.Printf("[TUN] Warning: iptables MSS clamping failed: %v", err)
 	}
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
 		log.Printf("[TUN] Warning: sysctl ip_forward failed: %v", err)
