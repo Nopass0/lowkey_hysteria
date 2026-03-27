@@ -5,18 +5,11 @@ import (
 	"net/http"
 	"time"
 
-	"hysteria_server/payments"
+	voidorm "github.com/Nopass0/void_go"
+
+	"hysteria_server/db"
 )
 
-// ─── POST /api/payments/create ────────────────────────────────────────────────
-
-// createPayment handles POST /api/payments/create.
-// Creates a Tochka SBP QR-code session and saves it to the payments table.
-//
-// @route  POST /api/payments/create
-// @body   { "amount": number }  (minimum 10 RUB)
-// @access authenticated
-// @returns { paymentId, qrUrl, sbpUrl, expiresAt }
 func (h *handler) createPayment(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 	var body struct {
@@ -30,23 +23,26 @@ func (h *handler) createPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call Tochka SBP API
 	qrcID, payloadURL, err := h.sbp.CreateSBP(body.Amount, "Пополнение баланса lowkey VPN")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("Failed to create payment: "+err.Error()))
 		return
 	}
 
-	expiresAt := time.Now().Add(30 * time.Minute)
+	expiresAt := time.Now().Add(30 * time.Minute).UTC()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var paymentID string
-	err = h.db.QueryRow(ctx, `
-		INSERT INTO payments(id,"userId","sbpPaymentId",amount,status,"qrUrl","sbpUrl","createdAt","expiresAt")
-		VALUES(gen_random_uuid(),$1,$2,$3,'pending',$4,$4,NOW(),$5)
-		RETURNING id
-	`, userID, qrcID, body.Amount, payloadURL, expiresAt).Scan(&paymentID)
+	paymentID, err := db.Insert(ctx, "payments", voidorm.Doc{
+		"userId":       userID,
+		"sbpPaymentId": qrcID,
+		"amount":       body.Amount,
+		"status":       "pending",
+		"qrUrl":        payloadURL,
+		"sbpUrl":       payloadURL,
+		"createdAt":    time.Now().UTC(),
+		"expiresAt":    expiresAt,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("Failed to store payment"))
 		return
@@ -60,66 +56,57 @@ func (h *handler) createPayment(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── GET /api/payments/{id}/status ───────────────────────────────────────────
-
-// paymentStatus handles GET /api/payments/{id}/status.
-// Polls Tochka for payment status; credits user balance on success.
-//
-// @route  GET /api/payments/{id}/status
-// @param  id - payment UUID
-// @access authenticated
-// @returns { paymentId, status, amount }
 func (h *handler) paymentStatus(w http.ResponseWriter, r *http.Request) {
-	userID    := getUserID(r)
+	userID := getUserID(r)
 	paymentID := r.PathValue("id")
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	type payRow struct {
-		ID           string
-		UserID       string
-		SbpPaymentID string
-		Amount       float64
-		Status       string
-		ExpiresAt    time.Time
-	}
-	var p payRow
-	err := h.db.QueryRow(ctx, `
-		SELECT id, "userId", "sbpPaymentId", amount, status, "expiresAt"
-		FROM payments WHERE id=$1
-	`, paymentID).Scan(&p.ID, &p.UserID, &p.SbpPaymentID, &p.Amount, &p.Status, &p.ExpiresAt)
+	paymentDoc, err := db.FindByID(ctx, "payments", paymentID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errmsg("Payment not found"))
 		return
 	}
-	if p.UserID != userID {
+	if db.AsString(paymentDoc, "userId") != userID {
 		writeJSON(w, http.StatusForbidden, errmsg("Forbidden"))
 		return
 	}
 
-	resp := func(status string) { writeJSON(w, http.StatusOK, map[string]any{"paymentId": p.ID, "status": status, "amount": p.Amount}) }
+	amount := db.AsFloat64(paymentDoc, "amount")
+	status := db.AsString(paymentDoc, "status")
+	expiresAt := db.AsTime(paymentDoc, "expiresAt")
+	sbpPaymentID := db.AsString(paymentDoc, "sbpPaymentId")
 
-	if p.Status != "pending" {
-		resp(p.Status)
+	resp := func(nextStatus string) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"paymentId": paymentID,
+			"status":    nextStatus,
+			"amount":    amount,
+		})
+	}
+
+	if status != "pending" {
+		resp(status)
 		return
 	}
-	if time.Now().After(p.ExpiresAt) {
-		h.db.Exec(ctx, `UPDATE payments SET status='expired' WHERE id=$1`, p.ID) //nolint:errcheck
+
+	if !expiresAt.IsZero() && time.Now().After(expiresAt) {
+		_, _ = db.Patch(ctx, "payments", paymentID, voidorm.Doc{"status": "expired"})
 		resp("expired")
 		return
 	}
 
-	sbpResp, err := h.sbp.GetPaymentStatus(p.SbpPaymentID)
+	sbpResp, err := h.sbp.GetPaymentStatus(sbpPaymentID)
 	if err == nil && sbpResp != nil {
 		switch sbpResp.OperationStatus {
 		case "ACWP", "ACSC", "Accepted":
-			h.db.Exec(ctx, `UPDATE payments SET status='success' WHERE id=$1`, p.ID) //nolint:errcheck
-			payments.OnPaymentSuccess(h.db, ctx, p.UserID, p.Amount)                 //nolint:errcheck
+			_, _ = db.Patch(ctx, "payments", paymentID, voidorm.Doc{"status": "success"})
+			_ = h.sbp.OnPaymentSuccess(ctx, userID, amount)
 			resp("success")
 			return
 		case "RJCT", "CANC", "Rejected":
-			h.db.Exec(ctx, `UPDATE payments SET status='failed' WHERE id=$1`, p.ID) //nolint:errcheck
+			_, _ = db.Patch(ctx, "payments", paymentID, voidorm.Doc{"status": "failed"})
 			resp("failed")
 			return
 		}

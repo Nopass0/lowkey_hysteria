@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,7 +14,10 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	voidorm "github.com/Nopass0/void_go"
 	"golang.org/x/crypto/bcrypt"
+
+	"hysteria_server/db"
 )
 
 type loginReq struct {
@@ -52,14 +56,14 @@ func generateReferralCode(login string) string {
 		loginUpper = loginUpper[:8]
 	}
 	b := make([]byte, 2)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	suffix := strings.ToUpper(hex.EncodeToString(b))
 	return fmt.Sprintf("%s%s", loginUpper, suffix)
 }
 
 func (h *handler) signJwt(userID string, isAdmin bool) (string, error) {
 	jti := uuid.New().String()
-	exp := time.Now().Add(30 * 24 * time.Hour).Unix() // 30 days
+	exp := time.Now().Add(30 * 24 * time.Hour).Unix()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"userId":  userID,
 		"isAdmin": isAdmin,
@@ -77,39 +81,40 @@ func (h *handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var id, passwordHash string
-	var isBanned bool
-	err := h.db.QueryRow(r.Context(), `SELECT id, "passwordHash", "isBanned" FROM users WHERE login = $1`, req.Login).
-		Scan(&id, &passwordHash, &isBanned)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
+	userDoc, err := db.FindOne(ctx, "users", voidorm.NewQuery().Where("login", voidorm.Eq, req.Login))
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errmsg("User not found"))
 		return
 	}
 
-	if isBanned {
+	if db.AsBool(userDoc, "isBanned") {
 		writeJSON(w, http.StatusForbidden, errmsg("Account banned"))
 		return
 	}
 
+	passwordHash := db.AsString(userDoc, "passwordHash")
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
 		writeJSON(w, http.StatusUnauthorized, errmsg("Wrong password"))
 		return
 	}
 
-	token, err := h.signJwt(id, false)
+	token, err := h.signJwt(db.AsString(userDoc, "_id"), db.AsBool(userDoc, "isAdmin"))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("Internal server error"))
 		return
 	}
 
+	login := db.AsString(userDoc, "login")
 	writeJSON(w, http.StatusOK, authResp{
 		Token: token,
 		User: authUser{
-			ID:         id,
-			Login:      req.Login,
-			AvatarHash: avatarHash(req.Login),
-			IsAdmin:    false,
+			ID:         db.AsString(userDoc, "_id"),
+			Login:      login,
+			AvatarHash: avatarHash(login),
+			IsAdmin:    db.AsBool(userDoc, "isAdmin"),
 		},
 	})
 }
@@ -125,15 +130,15 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errmsg("Login must be 3-24 chars, alphanumeric + underscore"))
 		return
 	}
-
 	if len(req.Password) < 6 {
 		writeJSON(w, http.StatusBadRequest, errmsg("Password must be at least 6 characters"))
 		return
 	}
 
-	var existing string
-	h.db.QueryRow(r.Context(), `SELECT id FROM users WHERE login = $1`, req.Login).Scan(&existing)
-	if existing != "" {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	if _, err := db.FindOne(ctx, "users", voidorm.NewQuery().Where("login", voidorm.Eq, req.Login)); err == nil {
 		writeJSON(w, http.StatusConflict, errmsg("Login already taken"))
 		return
 	}
@@ -144,30 +149,40 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var referredByID *string
+	referredByID := ""
 	if req.ReferralCode != nil && *req.ReferralCode != "" {
-		var rId string
-		if err := h.db.QueryRow(r.Context(), `SELECT id FROM users WHERE "referralCode" = $1`, *req.ReferralCode).Scan(&rId); err == nil {
-			referredByID = &rId
+		if refDoc, err := db.FindOne(ctx, "users", voidorm.NewQuery().Where("referralCode", voidorm.Eq, *req.ReferralCode)); err == nil {
+			referredByID = db.AsString(refDoc, "_id")
 		}
 	}
 
-	var userReferralCode string
+	referralCode := ""
 	for {
-		userReferralCode = generateReferralCode(req.Login)
-		var c string
-		h.db.QueryRow(r.Context(), `SELECT id FROM users WHERE "referralCode" = $1`, userReferralCode).Scan(&c)
-		if c == "" {
+		referralCode = generateReferralCode(req.Login)
+		if _, err := db.FindOne(ctx, "users", voidorm.NewQuery().Where("referralCode", voidorm.Eq, referralCode)); err != nil {
 			break
 		}
 	}
 
-	var newUserID string
-	err = h.db.QueryRow(r.Context(), `
-		INSERT INTO users (login, "passwordHash", "referralCode", "referredById")
-		VALUES ($1, $2, $3, $4) RETURNING id
-	`, req.Login, string(hash), userReferralCode, referredByID).Scan(&newUserID)
+	doc := voidorm.Doc{
+		"login":               req.Login,
+		"passwordHash":        string(hash),
+		"balance":             0.0,
+		"referralBalance":     0.0,
+		"isBanned":            false,
+		"isAdmin":             false,
+		"referralCode":        referralCode,
+		"joinedAt":            time.Now().UTC(),
+		"pendingDiscountFixed": 0.0,
+		"pendingDiscountPct":   0.0,
+		"referralRate":         0.05,
+		"hideAiMenu":           false,
+	}
+	if referredByID != "" {
+		doc["referredById"] = referredByID
+	}
 
+	newUserID, err := db.Insert(ctx, "users", doc)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("Internal server error"))
 		return

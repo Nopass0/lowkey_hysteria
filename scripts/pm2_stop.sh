@@ -15,7 +15,7 @@ info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-PM2_APP_NAME="lowkey-vpn"
+PM2_APP_NAME="${PM2_APP_NAME:-lowkey-vpn}"
 CLEAN_IPTABLES=false
 
 # Parse args

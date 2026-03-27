@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"time"
-)
 
-// ─── User profile ─────────────────────────────────────────────────────────────
+	voidorm "github.com/Nopass0/void_go"
+
+	"hysteria_server/db"
+)
 
 type subInfo struct {
 	PlanID      string `json:"planId"`
@@ -16,10 +18,6 @@ type subInfo struct {
 	IsLifetime  bool   `json:"isLifetime"`
 }
 
-// getProfile handles GET /api/user/profile.
-//
-// @route  GET /api/user/profile
-// @access authenticated
 func (h *handler) getProfile(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -34,43 +32,38 @@ func (h *handler) getProfile(w http.ResponseWriter, r *http.Request) {
 		JoinedAt        string   `json:"joinedAt"`
 	}
 
-	var p profile
-	var joinedAt time.Time
-	err := h.db.QueryRow(ctx, `
-		SELECT id, login, balance, "referralBalance", "joinedAt"
-		FROM users WHERE id = $1
-	`, userID).Scan(&p.ID, &p.Login, &p.Balance, &p.ReferralBalance, &joinedAt)
+	userDoc, err := db.FindByID(ctx, "users", userID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errmsg("user not found"))
 		return
 	}
-	p.JoinedAt = joinedAt.Format(time.RFC3339)
 
-	var sub subInfo
-	var activeUntil time.Time
-	err = h.db.QueryRow(ctx, `
-		SELECT "planId", "planName", "activeUntil", "isLifetime"
-		FROM subscriptions WHERE "userId" = $1
-	`, userID).Scan(&sub.PlanID, &sub.PlanName, &activeUntil, &sub.IsLifetime)
+	p := profile{
+		ID:              db.AsString(userDoc, "_id"),
+		Login:           db.AsString(userDoc, "login"),
+		Balance:         db.AsFloat64(userDoc, "balance"),
+		ReferralBalance: db.AsFloat64(userDoc, "referralBalance"),
+		JoinedAt:        db.AsTime(userDoc, "joinedAt").Format(time.RFC3339),
+	}
+
+	subDoc, err := db.FindOne(ctx, "subscriptions", voidorm.NewQuery().Where("userId", voidorm.Eq, userID))
 	if err == nil {
-		sub.ActiveUntil = activeUntil.Format(time.RFC3339)
-		p.Subscription = &sub
+		p.Subscription = &subInfo{
+			PlanID:      db.AsString(subDoc, "planId"),
+			PlanName:    db.AsString(subDoc, "planName"),
+			ActiveUntil: db.AsTime(subDoc, "activeUntil").Format(time.RFC3339),
+			IsLifetime:  db.AsBool(subDoc, "isLifetime"),
+		}
 	}
 
 	writeJSON(w, http.StatusOK, p)
 }
 
-// ─── Transactions ─────────────────────────────────────────────────────────────
-
-// getTransactions handles GET /api/user/transactions?page=1&pageSize=10.
-//
-// @route  GET /api/user/transactions
-// @access authenticated
 func (h *handler) getTransactions(w http.ResponseWriter, r *http.Request) {
-	userID   := getUserID(r)
-	page     := queryInt(r, "page", 1)
+	userID := getUserID(r)
+	page := queryInt(r, "page", 1)
 	pageSize := queryInt(r, "pageSize", 10)
-	skip     := (page - 1) * pageSize
+	skip := (page - 1) * pageSize
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -83,38 +76,40 @@ func (h *handler) getTransactions(w http.ResponseWriter, r *http.Request) {
 		CreatedAt string  `json:"createdAt"`
 	}
 
-	rows, err := h.db.Query(ctx, `
-		SELECT id, type, amount, title, "createdAt"
-		FROM transactions WHERE "userId" = $1
-		ORDER BY "createdAt" DESC LIMIT $2 OFFSET $3
-	`, userID, pageSize, skip)
+	rows, total, err := db.QueryCount(
+		ctx,
+		"transactions",
+		voidorm.NewQuery().
+			Where("userId", voidorm.Eq, userID).
+			OrderBy("createdAt", voidorm.Desc).
+			Skip(skip).
+			Limit(pageSize),
+	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
 		return
 	}
-	defer rows.Close()
 
-	var items []txItem
-	for rows.Next() {
-		var item txItem
-		var createdAt time.Time
-		if err = rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Title, &createdAt); err == nil {
-			item.CreatedAt = createdAt.Format(time.RFC3339)
-			items = append(items, item)
-		}
+	items := make([]txItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, txItem{
+			ID:        db.AsString(row, "_id"),
+			Type:      db.AsString(row, "type"),
+			Amount:    db.AsFloat64(row, "amount"),
+			Title:     db.AsString(row, "title"),
+			CreatedAt: db.AsTime(row, "createdAt").Format(time.RFC3339),
+		})
 	}
 
-	var total int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE "userId"=$1`, userID).Scan(&total) //nolint:errcheck
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items, "total": total,
-		"page": page, "pageSize": pageSize,
-		"totalPages": (total + pageSize - 1) / pageSize,
+		"items":      items,
+		"total":      total,
+		"page":       page,
+		"pageSize":   pageSize,
+		"totalPages": int((total + int64(pageSize) - 1) / int64(pageSize)),
 	})
 }
 
-// formatFloat форматирует float64 без лишних нулей.
 func formatFloat(f float64) string {
 	s := fmt.Sprintf("%.2f", f)
 	for len(s) > 1 && s[len(s)-1] == '0' {
@@ -126,7 +121,6 @@ func formatFloat(f float64) string {
 	return s
 }
 
-// max64 возвращает большее из двух float64.
 func max64(a, b float64) float64 {
 	if a > b {
 		return a

@@ -1,5 +1,3 @@
-// Package auth provides JWT verification and subscription validation for
-// incoming VPN connections.
 package auth
 
 import (
@@ -8,27 +6,17 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	voidorm "github.com/Nopass0/void_go"
+
+	"hysteria_server/db"
 )
 
-// Result is returned by AuthenticateAndRegister.
 type Result struct {
-	// OK is true when the user is authenticated and has an active subscription.
-	OK bool
-
-	// UserID is the authenticated user's UUID string.
+	OK     bool
 	UserID string
-
-	// Reason contains a human-readable error message when OK is false.
 	Reason string
 }
 
-// VerifyJWT parses and validates a JWT token string, returning the contained
-// userId claim on success.
-//
-// @param tokenStr - raw JWT string from the client hello message
-// @param secret   - HMAC secret used to sign tokens
-// @returns (userId string, error)
 func VerifyJWT(tokenStr string, secret []byte) (string, error) {
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -52,14 +40,7 @@ func VerifyJWT(tokenStr string, secret []byte) (string, error) {
 	return userID, nil
 }
 
-// AuthenticateAndRegister verifies the JWT, looks up the user's subscription
-// in the database, and returns an auth Result.
-//
-// @param pool      - PostgreSQL connection pool
-// @param token     - raw JWT string from ClientHello.Auth
-// @param jwtSecret - HMAC secret
-// @returns Result
-func AuthenticateAndRegister(pool *pgxpool.Pool, token string, jwtSecret []byte) Result {
+func AuthenticateAndRegister(token string, jwtSecret []byte) Result {
 	userID, err := VerifyJWT(token, jwtSecret)
 	if err != nil {
 		return Result{Reason: "unauthorized: " + err.Error()}
@@ -68,18 +49,18 @@ func AuthenticateAndRegister(pool *pgxpool.Pool, token string, jwtSecret []byte)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var isLifetime bool
-	var activeUntil time.Time
-	// Look up the user's subscription — only the active/lifetime columns are needed.
-	err = pool.QueryRow(ctx,
-		`SELECT "isLifetime", "activeUntil" FROM subscriptions WHERE "userId" = $1`,
-		userID,
-	).Scan(&isLifetime, &activeUntil)
+	sub, err := db.FindOne(
+		ctx,
+		"subscriptions",
+		voidorm.NewQuery().Where("userId", voidorm.Eq, userID),
+	)
 	if err != nil {
 		return Result{Reason: "нет активной подписки"}
 	}
 
-	if !isLifetime && time.Now().After(activeUntil) {
+	isLifetime := db.AsBool(sub, "isLifetime")
+	activeUntil := db.AsTime(sub, "activeUntil")
+	if !isLifetime && (activeUntil.IsZero() || time.Now().After(activeUntil)) {
 		return Result{Reason: "подписка истекла"}
 	}
 

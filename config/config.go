@@ -29,14 +29,29 @@ type Config struct {
 	// Port is the numeric port extracted from ListenAddr (used for DB registration).
 	Port int
 
-	// PublicIP is the auto-detected public IP of this machine.
+	// PublicIP is the public IP of this machine. When empty it is auto-detected.
 	PublicIP string
 
-	// DatabaseURL is the PostgreSQL connection string.
-	DatabaseURL string
+	// PublicHostname is the public DNS hostname assigned to this node.
+	PublicHostname string
 
-	// RedisURL is the Redis connection string.
-	RedisURL string
+	// CertFile is an optional TLS fullchain path used by the Hysteria listener.
+	CertFile string
+
+	// KeyFile is an optional TLS private key path used by the Hysteria listener.
+	KeyFile string
+
+	// VoidDBURL is the VoidDB HTTP endpoint.
+	VoidDBURL string
+
+	// VoidDBToken is an optional pre-issued bearer token.
+	VoidDBToken string
+
+	// VoidDBUsername is the login used when no bearer token is supplied.
+	VoidDBUsername string
+
+	// VoidDBPassword is the password used when no bearer token is supplied.
+	VoidDBPassword string
 
 	// JWTSecret is the shared HMAC secret used to verify user JWT tokens.
 	JWTSecret []byte
@@ -53,6 +68,9 @@ type Config struct {
 
 	// TochkaAccountID is the bank account identifier in the Tochka system.
 	TochkaAccountID string
+
+	// XrayPort is the TCP port the VLESS/Xray inbound listens on.
+	XrayPort int
 }
 
 // Load reads configuration from the environment (+ optional .env file) and
@@ -73,16 +91,30 @@ func Load() *Config {
 		ListenAddr:       listenAddr,
 		HTTPAddr:         getenv("HTTP_ADDR", ":8080"),
 		Port:             port,
-		DatabaseURL:      getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/lowkey"),
-		RedisURL:         getenv("REDIS_URL", "redis://localhost:6379"),
+		PublicIP:         getenv("SERVER_IP", ""),
+		PublicHostname:   getenv("SERVER_HOSTNAME", ""),
+		CertFile:         getenv("CERT_FILE", ""),
+		KeyFile:          getenv("KEY_FILE", ""),
+		VoidDBURL:        getenv("VOIDDB_URL", "http://localhost:7700"),
+		VoidDBToken:      getenv("VOIDDB_TOKEN", ""),
+		VoidDBUsername:   getenv("VOIDDB_USERNAME", "admin"),
+		VoidDBPassword:   getenv("VOIDDB_PASSWORD", "admin"),
 		JWTSecret:        []byte(jwtSecretStr),
 		BackendURL:       getenv("BACKEND_URL", "http://localhost:3001"),
 		TochkaAPIKey:     getenv("TOCHKA_API_KEY", ""),
 		TochkaMerchantID: getenv("TOCHKA_MERCHANT_ID", ""),
 		TochkaAccountID:  getenv("TOCHKA_ACCOUNT_ID", ""),
+		XrayPort:         getenvInt("XRAY_PORT", 443),
 	}
 
-	log.Printf("[Config] ListenAddr=%s | HTTPAddr=%s", cfg.ListenAddr, cfg.HTTPAddr)
+	log.Printf(
+		"[Config] ListenAddr=%s | HTTPAddr=%s | PublicIP=%s | Hostname=%s | XrayPort=%d",
+		cfg.ListenAddr,
+		cfg.HTTPAddr,
+		cfg.PublicIP,
+		cfg.PublicHostname,
+		cfg.XrayPort,
+	)
 	return cfg
 }
 

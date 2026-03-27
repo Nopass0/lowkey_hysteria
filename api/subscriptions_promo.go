@@ -2,16 +2,15 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-)
+	voidorm "github.com/Nopass0/void_go"
 
-// ─── Subscription plans ───────────────────────────────────────────────────────
+	"hysteria_server/db"
+)
 
 type plan struct {
 	ID        string             `json:"id"`
@@ -22,39 +21,22 @@ type plan struct {
 }
 
 var plans = []plan{
-	{ID: "starter", Name: "Начальный",
-		Prices:   map[string]float64{"monthly": 149, "3months": 129, "6months": 99, "yearly": 79},
-		Features: []string{"1 устройство", "Базовая скорость", "Доступ к 5 локациям"},
-	},
-	{ID: "pro", Name: "Продвинутый", IsPopular: true,
-		Prices:   map[string]float64{"monthly": 299, "3months": 249, "6months": 199, "yearly": 149},
-		Features: []string{"3 устройства", "Высокая скорость", "Доступ ко всем локациям", "Kill Switch"},
-	},
-	{ID: "advanced", Name: "Максимальный",
-		Prices:   map[string]float64{"monthly": 499, "3months": 399, "6months": 349, "yearly": 249},
-		Features: []string{"5 устройств", "Максимальная скорость", "Доступ ко всем локациям", "Kill Switch", "Выделенный IP", "Приоритетная поддержка"},
-	},
+	{ID: "starter", Name: "Начальный", Prices: map[string]float64{"monthly": 149, "3months": 129, "6months": 99, "yearly": 79}, Features: []string{"1 устройство", "Базовая скорость", "Доступ к 5 локациям"}},
+	{ID: "pro", Name: "Продвинутый", IsPopular: true, Prices: map[string]float64{"monthly": 299, "3months": 249, "6months": 199, "yearly": 149}, Features: []string{"3 устройства", "Высокая скорость", "Доступ ко всем локациям", "Kill Switch"}},
+	{ID: "advanced", Name: "Максимальный", Prices: map[string]float64{"monthly": 499, "3months": 399, "6months": 349, "yearly": 249}, Features: []string{"5 устройств", "Максимальная скорость", "Доступ ко всем локациям", "Kill Switch", "Выделенный IP", "Приоритетная поддержка"}},
 }
 
 var periodDays = map[string]int{
-	"monthly": 30, "3months": 90, "6months": 180, "yearly": 365,
+	"monthly": 30,
+	"3months": 90,
+	"6months": 180,
+	"yearly":  365,
 }
 
-// getPlans handles GET /api/subscriptions/plans (public).
-//
-// @route GET /api/subscriptions/plans
-// @access public
 func (h *handler) getPlans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, plans)
 }
 
-// purchaseSubscription handles POST /api/subscriptions/purchase.
-// Reads pendingDiscountPct / pendingDiscountFixed, applies and resets them
-// atomically, deducts from balance, creates/updates subscription.
-//
-// @route POST /api/subscriptions/purchase
-// @body  { "planId": string, "period": string }
-// @access authenticated
 func (h *handler) purchaseSubscription(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 	var body struct {
@@ -65,41 +47,39 @@ func (h *handler) purchaseSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate plan and period
-	var p *plan
+	var selected *plan
 	for i := range plans {
 		if plans[i].ID == body.PlanID {
-			p = &plans[i]
+			selected = &plans[i]
 			break
 		}
 	}
-	if p == nil {
+	if selected == nil {
 		writeJSON(w, http.StatusNotFound, errmsg("plan not found"))
 		return
 	}
-	pricePerMonth, ok := p.Prices[body.Period]
+
+	pricePerMonth, ok := selected.Prices[body.Period]
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errmsg("invalid billing period"))
 		return
 	}
-	days := periodDays[body.Period]
 
+	days := periodDays[body.Period]
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Fetch user with discount fields
-	var balance, discPct, discFixed float64
-	var referredByID *string
-	err := h.db.QueryRow(ctx, `
-		SELECT balance, "pendingDiscountPct", "pendingDiscountFixed", "referredById"
-		FROM users WHERE id = $1
-	`, userID).Scan(&balance, &discPct, &discFixed, &referredByID)
+	userDoc, err := db.FindByID(ctx, "users", userID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errmsg("user not found"))
 		return
 	}
 
-	// Calculate price
+	balance := db.AsFloat64(userDoc, "balance")
+	discPct := db.AsFloat64(userDoc, "pendingDiscountPct")
+	discFixed := db.AsFloat64(userDoc, "pendingDiscountFixed")
+	referredByID := db.AsString(userDoc, "referredById")
+
 	months := float64(days) / 30.0
 	basePrice := pricePerMonth * months
 	finalPrice := basePrice
@@ -119,9 +99,23 @@ func (h *handler) purchaseSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activeUntil := time.Now().Add(time.Duration(days) * 24 * time.Hour)
+	newBalance := balance - finalPrice
+	activeUntil := time.Now().Add(time.Duration(days) * 24 * time.Hour).UTC()
+
+	if _, err = db.Patch(ctx, "users", userID, voidorm.Doc{
+		"balance":              newBalance,
+		"pendingDiscountPct":   0.0,
+		"pendingDiscountFixed": 0.0,
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errmsg("balance update failed"))
+		return
+	}
+
 	periodLabel := map[string]string{
-		"monthly": "1 мес.", "3months": "3 мес.", "6months": "6 мес.", "yearly": "1 год",
+		"monthly": "1 мес.",
+		"3months": "3 мес.",
+		"6months": "6 мес.",
+		"yearly":  "1 год",
 	}[body.Period]
 
 	var discNoteParts []string
@@ -136,54 +130,63 @@ func (h *handler) purchaseSubscription(w http.ResponseWriter, r *http.Request) {
 		discNote = " (" + strings.Join(discNoteParts, ", ") + ")"
 	}
 
-	// Execute in transaction
-	tx, err := h.db.Begin(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
-		return
+	_, _ = db.Insert(ctx, "transactions", voidorm.Doc{
+		"userId":    userID,
+		"type":      "subscription",
+		"amount":    -finalPrice,
+		"title":     `Подписка "` + selected.Name + `" на ` + periodLabel + discNote,
+		"createdAt": time.Now().UTC(),
+	})
+
+	subscription, subErr := db.FindOne(ctx, "subscriptions", voidorm.NewQuery().Where("userId", voidorm.Eq, userID))
+	if subErr == nil {
+		_, err = db.Patch(ctx, "subscriptions", db.AsString(subscription, "_id"), voidorm.Doc{
+			"planId":      selected.ID,
+			"planName":    selected.Name,
+			"activeUntil": activeUntil,
+			"isLifetime":  false,
+			"updatedAt":   time.Now().UTC(),
+		})
+	} else {
+		_, err = db.Insert(ctx, "subscriptions", voidorm.Doc{
+			"userId":      userID,
+			"planId":      selected.ID,
+			"planName":    selected.Name,
+			"activeUntil": activeUntil,
+			"isLifetime":  false,
+			"createdAt":   time.Now().UTC(),
+			"updatedAt":   time.Now().UTC(),
+		})
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	var newBalance float64
-	err = tx.QueryRow(ctx, `
-		UPDATE users SET balance=balance-$1,"pendingDiscountPct"=0,"pendingDiscountFixed"=0
-		WHERE id=$2 RETURNING balance
-	`, finalPrice, userID).Scan(&newBalance)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errmsg("balance update failed"))
-		return
-	}
-
-	tx.Exec(ctx, `INSERT INTO transactions(id,"userId",type,amount,title,"createdAt") VALUES(gen_random_uuid(),$1,'subscription',$2,$3,NOW())`,
-		userID, -finalPrice, `Подписка "`+p.Name+`" на `+periodLabel+discNote) //nolint:errcheck
-
-	var subPlanID, subPlanName string
-	var subUntil time.Time
-	var subLifetime bool
-	err = tx.QueryRow(ctx, `
-		INSERT INTO subscriptions(id,"userId","planId","planName","activeUntil","isLifetime","createdAt","updatedAt")
-		VALUES(gen_random_uuid(),$1,$2,$3,$4,false,NOW(),NOW())
-		ON CONFLICT("userId") DO UPDATE SET "planId"=$2,"planName"=$3,"activeUntil"=$4,"updatedAt"=NOW()
-		RETURNING "planId","planName","activeUntil","isLifetime"
-	`, userID, p.ID, p.Name, activeUntil).Scan(&subPlanID, &subPlanName, &subUntil, &subLifetime)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("subscription upsert failed"))
 		return
 	}
 
-	if referredByID != nil {
-		commission := finalPrice * 0.2
-		tx.Exec(ctx, `UPDATE users SET "referralBalance"="referralBalance"+$1 WHERE id=$2`, commission, *referredByID) //nolint:errcheck
-		tx.Exec(ctx, `INSERT INTO transactions(id,"userId",type,amount,title,"createdAt") VALUES(gen_random_uuid(),$1,'referral_earning',$2,'Реферальное начисление',NOW())`, *referredByID, commission) //nolint:errcheck
-	}
-
-	if err = tx.Commit(ctx); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errmsg("commit failed"))
-		return
+	if referredByID != "" {
+		refDoc, refErr := db.FindByID(ctx, "users", referredByID)
+		if refErr == nil {
+			commission := finalPrice * 0.2
+			_, _ = db.Patch(ctx, "users", referredByID, voidorm.Doc{
+				"referralBalance": db.AsFloat64(refDoc, "referralBalance") + commission,
+			})
+			_, _ = db.Insert(ctx, "transactions", voidorm.Doc{
+				"userId":    referredByID,
+				"type":      "referral_earning",
+				"amount":    commission,
+				"title":     "Реферальное начисление",
+				"createdAt": time.Now().UTC(),
+			})
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"subscription":    map[string]any{"planId": subPlanID, "planName": subPlanName, "activeUntil": subUntil.Format(time.RFC3339), "isLifetime": subLifetime},
+		"subscription": map[string]any{
+			"planId":      selected.ID,
+			"planName":    selected.Name,
+			"activeUntil": activeUntil.Format(time.RFC3339),
+			"isLifetime":  false,
+		},
 		"newBalance":      newBalance,
 		"originalPrice":   basePrice,
 		"finalPrice":      finalPrice,
@@ -191,18 +194,11 @@ func (h *handler) purchaseSubscription(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── Promo codes ──────────────────────────────────────────────────────────────
-
 type promoEffect struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
-// activatePromo handles POST /api/user/promo/activate.
-//
-// @route POST /api/user/promo/activate
-// @body  { "code": string }
-// @access authenticated
 func (h *handler) activatePromo(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 	var body struct {
@@ -216,109 +212,142 @@ func (h *handler) activatePromo(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	var promoID string
-	var maxActivations *int
-	var effectsJSON []byte
-	err := h.db.QueryRow(ctx, `
-		SELECT id, "maxActivations", effects FROM promo_codes WHERE LOWER(code)=LOWER($1)
-	`, body.Code).Scan(&promoID, &maxActivations, &effectsJSON)
+	promoRows, err := db.FindMany(ctx, "promo_codes", voidorm.NewQuery().Limit(250))
 	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
+		return
+	}
+
+	var promoDoc voidorm.Doc
+	for _, row := range promoRows {
+		if strings.EqualFold(db.AsString(row, "code"), body.Code) {
+			promoDoc = row
+			break
+		}
+	}
+	if promoDoc == nil {
 		writeJSON(w, http.StatusNotFound, errmsg("Промокод не найден"))
 		return
 	}
 
-	var existing int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM promo_activations WHERE "userId"=$1 AND "promoCodeId"=$2`, userID, promoID).Scan(&existing) //nolint:errcheck
+	promoID := db.AsString(promoDoc, "_id")
+	existing, _ := db.CountMatching(
+		ctx,
+		"promo_activations",
+		voidorm.NewQuery().
+			Where("userId", voidorm.Eq, userID).
+			Where("promoCodeId", voidorm.Eq, promoID),
+	)
 	if existing > 0 {
 		writeJSON(w, http.StatusConflict, errmsg("Вы уже активировали этот промокод"))
 		return
 	}
 
-	if maxActivations != nil {
-		var count int
-		h.db.QueryRow(ctx, `SELECT COUNT(*) FROM promo_activations WHERE "promoCodeId"=$1`, promoID).Scan(&count) //nolint:errcheck
-		if count >= *maxActivations {
+	maxActivations := db.AsInt(promoDoc, "maxActivations")
+	if maxActivations > 0 {
+		total, _ := db.CountMatching(ctx, "promo_activations", voidorm.NewQuery().Where("promoCodeId", voidorm.Eq, promoID))
+		if total >= int64(maxActivations) {
 			writeJSON(w, http.StatusUnprocessableEntity, errmsg("Лимит активаций исчерпан"))
 			return
 		}
 	}
 
 	var effects []promoEffect
-	if err = json.Unmarshal(effectsJSON, &effects); err != nil {
+	if err = db.UnmarshalField(promoDoc, "effects", &effects); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("promo effects parse error"))
 		return
 	}
 
-	tx, err := h.db.Begin(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
+	if _, err = db.Insert(ctx, "promo_activations", voidorm.Doc{
+		"userId":      userID,
+		"promoCodeId": promoID,
+		"activatedAt": time.Now().UTC(),
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errmsg("activation failed"))
 		return
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	tx.Exec(ctx, `INSERT INTO promo_activations(id,"userId","promoCodeId","activatedAt") VALUES(gen_random_uuid(),$1,$2,NOW())`, userID, promoID) //nolint:errcheck
 
 	var descriptions []string
 	for _, ef := range effects {
-		desc := applyEffect(ctx, tx, userID, ef)
-		if desc != "" {
+		if desc := applyEffect(ctx, userID, ef); desc != "" {
 			descriptions = append(descriptions, desc)
 		}
 	}
 
-	var newBalance float64
-	tx.QueryRow(ctx, `SELECT balance FROM users WHERE id=$1`, userID).Scan(&newBalance) //nolint:errcheck
-
-	if err = tx.Commit(ctx); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errmsg("commit failed"))
-		return
-	}
-
+	userDoc, _ := db.FindByID(ctx, "users", userID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":           true,
 		"message":           "Промокод активирован",
 		"rewardDescription": strings.Join(descriptions, ", "),
-		"newBalance":        newBalance,
+		"newBalance":        db.AsFloat64(userDoc, "balance"),
 	})
 }
 
-// applyEffect применяет один эффект промокода внутри транзакции.
-// Возвращает человекочитаемое описание применённого эффекта.
-func applyEffect(ctx context.Context, tx pgx.Tx, userID string, ef promoEffect) string {
+func applyEffect(ctx context.Context, userID string, ef promoEffect) string {
+	userDoc, err := db.FindByID(ctx, "users", userID)
+	if err != nil {
+		return ""
+	}
+
 	switch ef.Key {
 	case "add_balance":
 		var amount float64
-		n, _ := fmt.Sscanf(ef.Value, "%f", &amount)
-		if n == 1 && amount > 0 {
-			tx.Exec(ctx, `UPDATE users SET balance=balance+$1 WHERE id=$2`, amount, userID) //nolint:errcheck
-			tx.Exec(ctx, `INSERT INTO transactions(id,"userId",type,amount,title,"createdAt") VALUES(gen_random_uuid(),$1,'promo_topup',$2,'Бонус по промокоду',NOW())`, userID, amount) //nolint:errcheck
+		if _, err := fmt.Sscanf(ef.Value, "%f", &amount); err == nil && amount > 0 {
+			_, _ = db.Patch(ctx, "users", userID, voidorm.Doc{
+				"balance": db.AsFloat64(userDoc, "balance") + amount,
+			})
+			_, _ = db.Insert(ctx, "transactions", voidorm.Doc{
+				"userId":    userID,
+				"type":      "promo_topup",
+				"amount":    amount,
+				"title":     "Бонус по промокоду",
+				"createdAt": time.Now().UTC(),
+			})
 			return "+" + formatFloat(amount) + " ₽ на баланс"
 		}
 	case "plan_discount_pct":
 		var pct float64
-		n, _ := fmt.Sscanf(ef.Value, "%f", &pct)
-		if n == 1 && pct > 0 {
-			tx.Exec(ctx, `UPDATE users SET "pendingDiscountPct"=GREATEST("pendingDiscountPct",$1) WHERE id=$2`, pct, userID) //nolint:errcheck
+		if _, err := fmt.Sscanf(ef.Value, "%f", &pct); err == nil && pct > 0 {
+			current := db.AsFloat64(userDoc, "pendingDiscountPct")
+			if pct < current {
+				pct = current
+			}
+			_, _ = db.Patch(ctx, "users", userID, voidorm.Doc{"pendingDiscountPct": pct})
 			return "Скидка " + formatFloat(pct) + "% на подписку"
 		}
 	case "plan_discount_fixed":
 		var amount float64
-		n, _ := fmt.Sscanf(ef.Value, "%f", &amount)
-		if n == 1 && amount > 0 {
-			tx.Exec(ctx, `UPDATE users SET "pendingDiscountFixed"="pendingDiscountFixed"+$1 WHERE id=$2`, amount, userID) //nolint:errcheck
+		if _, err := fmt.Sscanf(ef.Value, "%f", &amount); err == nil && amount > 0 {
+			_, _ = db.Patch(ctx, "users", userID, voidorm.Doc{
+				"pendingDiscountFixed": db.AsFloat64(userDoc, "pendingDiscountFixed") + amount,
+			})
 			return "Скидка " + formatFloat(amount) + " ₽ на подписку"
 		}
 	case "free_days":
 		var days int
-		n, _ := fmt.Sscanf(ef.Value, "%d", &days)
-		if n == 1 && days > 0 {
-			activeUntil := time.Now().Add(time.Duration(days) * 24 * time.Hour)
-			tx.Exec(ctx, `
-				INSERT INTO subscriptions(id,"userId","planId","planName","activeUntil","isLifetime","createdAt","updatedAt")
-				VALUES(gen_random_uuid(),$1,'starter','Начальный (пробный)',$2,false,NOW(),NOW())
-				ON CONFLICT("userId") DO UPDATE
-				  SET "activeUntil"=subscriptions."activeUntil"+($2-NOW()),"updatedAt"=NOW()
-			`, userID, activeUntil) //nolint:errcheck
+		if _, err := fmt.Sscanf(ef.Value, "%d", &days); err == nil && days > 0 {
+			subDoc, subErr := db.FindOne(ctx, "subscriptions", voidorm.NewQuery().Where("userId", voidorm.Eq, userID))
+			base := time.Now().UTC()
+			if subErr == nil {
+				currentUntil := db.AsTime(subDoc, "activeUntil")
+				if currentUntil.After(base) {
+					base = currentUntil
+				}
+				_, _ = db.Patch(ctx, "subscriptions", db.AsString(subDoc, "_id"), voidorm.Doc{
+					"activeUntil": base.Add(time.Duration(days) * 24 * time.Hour),
+					"updatedAt":   time.Now().UTC(),
+				})
+			} else {
+				_, _ = db.Insert(ctx, "subscriptions", voidorm.Doc{
+					"userId":      userID,
+					"planId":      "starter",
+					"planName":    "Начальный (пробный)",
+					"activeUntil": base.Add(time.Duration(days) * 24 * time.Hour),
+					"isLifetime":  false,
+					"createdAt":   time.Now().UTC(),
+					"updatedAt":   time.Now().UTC(),
+				})
+			}
 			return "+" + ef.Value + " дней подписки"
 		}
 	case "upgrade_plan":
@@ -331,35 +360,41 @@ func applyEffect(ctx context.Context, tx pgx.Tx, userID string, ef promoEffect) 
 		if planName == "" {
 			planName = planID
 		}
-		tx.Exec(ctx, `UPDATE subscriptions SET "planId"=$1,"planName"=$2,"updatedAt"=NOW() WHERE "userId"=$3`, planID, planName, userID) //nolint:errcheck
-		return `Апгрейд до "` + planName + `"`
+		subDoc, subErr := db.FindOne(ctx, "subscriptions", voidorm.NewQuery().Where("userId", voidorm.Eq, userID))
+		if subErr == nil {
+			_, _ = db.Patch(ctx, "subscriptions", db.AsString(subDoc, "_id"), voidorm.Doc{
+				"planId":    planID,
+				"planName":  planName,
+				"updatedAt": time.Now().UTC(),
+			})
+			return `Апгрейд до "` + planName + `"`
+		}
 	}
 	return ""
 }
 
-// promoHistory handles GET /api/user/promo/history.
-//
-// @route GET /api/user/promo/history
-// @access authenticated
 func (h *handler) promoHistory(w http.ResponseWriter, r *http.Request) {
-	userID   := getUserID(r)
-	page     := queryInt(r, "page", 1)
+	userID := getUserID(r)
+	page := queryInt(r, "page", 1)
 	pageSize := queryInt(r, "pageSize", 10)
-	skip     := (page - 1) * pageSize
+	skip := (page - 1) * pageSize
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	rows, err := h.db.Query(ctx, `
-		SELECT pa.id, pc.code, pc.effects, pa."activatedAt"
-		FROM promo_activations pa JOIN promo_codes pc ON pc.id=pa."promoCodeId"
-		WHERE pa."userId"=$1 ORDER BY pa."activatedAt" DESC LIMIT $2 OFFSET $3
-	`, userID, pageSize, skip)
+	rows, total, err := db.QueryCount(
+		ctx,
+		"promo_activations",
+		voidorm.NewQuery().
+			Where("userId", voidorm.Eq, userID).
+			OrderBy("activatedAt", voidorm.Desc).
+			Skip(skip).
+			Limit(pageSize),
+	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errmsg("db error"))
 		return
 	}
-	defer rows.Close()
 
 	type item struct {
 		ID          string `json:"id"`
@@ -367,45 +402,49 @@ func (h *handler) promoHistory(w http.ResponseWriter, r *http.Request) {
 		Description string `json:"description"`
 		ActivatedAt string `json:"activatedAt"`
 	}
-	var items []item
-	for rows.Next() {
-		var it item
-		var effectsJSON []byte
-		var activatedAt time.Time
-		if err = rows.Scan(&it.ID, &it.Code, &effectsJSON, &activatedAt); err != nil {
-			continue
+
+	items := make([]item, 0, len(rows))
+	for _, row := range rows {
+		it := item{
+			ID:          db.AsString(row, "_id"),
+			ActivatedAt: db.AsTime(row, "activatedAt").Format(time.RFC3339),
 		}
-		it.ActivatedAt = activatedAt.Format(time.RFC3339)
-		var effects []promoEffect
-		if json.Unmarshal(effectsJSON, &effects) == nil {
-			var parts []string
-			for _, e := range effects {
-				switch e.Key {
-				case "add_balance":
-					parts = append(parts, "+"+e.Value+" ₽")
-				case "free_days":
-					parts = append(parts, "+"+e.Value+" дней")
-				case "upgrade_plan":
-					parts = append(parts, "Апгрейд: "+e.Value)
-				case "plan_discount_pct":
-					parts = append(parts, "Скидка "+e.Value+"%")
-				case "plan_discount_fixed":
-					parts = append(parts, "Скидка "+e.Value+" ₽")
-				default:
-					parts = append(parts, e.Key)
+
+		promoID := db.AsString(row, "promoCodeId")
+		promoDoc, promoErr := db.FindByID(ctx, "promo_codes", promoID)
+		if promoErr == nil {
+			it.Code = db.AsString(promoDoc, "code")
+			var effects []promoEffect
+			if db.UnmarshalField(promoDoc, "effects", &effects) == nil {
+				var parts []string
+				for _, e := range effects {
+					switch e.Key {
+					case "add_balance":
+						parts = append(parts, "+"+e.Value+" ₽")
+					case "free_days":
+						parts = append(parts, "+"+e.Value+" дней")
+					case "upgrade_plan":
+						parts = append(parts, "Апгрейд: "+e.Value)
+					case "plan_discount_pct":
+						parts = append(parts, "Скидка "+e.Value+"%")
+					case "plan_discount_fixed":
+						parts = append(parts, "Скидка "+e.Value+" ₽")
+					default:
+						parts = append(parts, e.Key)
+					}
 				}
+				it.Description = strings.Join(parts, ", ")
 			}
-			it.Description = strings.Join(parts, ", ")
 		}
+
 		items = append(items, it)
 	}
 
-	var total int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM promo_activations WHERE "userId"=$1`, userID).Scan(&total) //nolint:errcheck
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items, "total": total,
-		"page": page, "pageSize": pageSize,
-		"totalPages": (total + pageSize - 1) / pageSize,
+		"items":      items,
+		"total":      total,
+		"page":       page,
+		"pageSize":   pageSize,
+		"totalPages": int((total + int64(pageSize) - 1) / int64(pageSize)),
 	})
 }

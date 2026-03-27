@@ -24,9 +24,9 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "\n${CYAN}══ $* ══${NC}"; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="$REPO_DIR/main"
+BINARY="$REPO_DIR/hysteria_server"
 ENV_FILE="$REPO_DIR/.env"
-PM2_APP_NAME="lowkey-vpn"
+PM2_APP_NAME="${PM2_APP_NAME:-lowkey-vpn}"
 
 # ─── 1. Check / install Go ────────────────────────────────────────────────────
 GO_MIN="1.21"
@@ -177,7 +177,8 @@ info "NAT and MSS rules applied ✓"
 step "Building Go binary"
 
 cd "$REPO_DIR"
-info "Running: go build -o main ."
+info "Running: go build -o hysteria_server ."
+mkdir -p "$REPO_DIR/logs"
 go build -o "$BINARY" .
 info "Build complete → $BINARY ✓"
 
@@ -187,13 +188,13 @@ step "Starting server in PM2"
 # Check if process exists by name (exact match)
 if pm2 show "$PM2_APP_NAME" > /dev/null 2>&1; then
     info "Restarting existing PM2 process '$PM2_APP_NAME'..."
-    pm2 restart "$PM2_APP_NAME" --update-env || pm2 start "$BINARY" --name "$PM2_APP_NAME" --interpreter none --no-autorestart --env production
+    pm2 restart "$PM2_APP_NAME" --update-env || pm2 start "$BINARY" --name "$PM2_APP_NAME" --interpreter none --cwd "$REPO_DIR" --update-env
 else
     info "Starting '$PM2_APP_NAME' in PM2..."
     pm2 start "$BINARY" \
         --name "$PM2_APP_NAME" \
         --interpreter none \
-        --no-autorestart \
+        --cwd "$REPO_DIR" \
         --log "$REPO_DIR/logs/vpn.log" \
         --error "$REPO_DIR/logs/vpn-error.log" \
         --env production
