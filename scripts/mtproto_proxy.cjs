@@ -106,7 +106,9 @@ const mtproto = new MTProtoProxy({
       return adTag;
     }
 
-    return undefined;
+    // mtprotoproxy expects a hex string here and later calls Buffer.from(...)
+    // unconditionally, so empty string is the safe "no sponsor" value.
+    return "";
   },
   leave(options) {
     activeConnections = Math.max(0, activeConnections - 1);
