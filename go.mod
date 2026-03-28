@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/google/gopacket v1.1.19 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/net v0.49.0 // indirect

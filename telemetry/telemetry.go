@@ -353,6 +353,17 @@ func ObserveVLESSAccess(userID, serverID, serverIP, remoteAddr, destination, net
 	}
 
 	if net.ParseIP(domain) != nil {
+		RegisterPendingVLESSFlow(
+			userID,
+			serverID,
+			serverIP,
+			remoteHost,
+			network,
+			domain,
+			port,
+			now,
+		)
+
 		resolvedDomain := resolveReverseDomain(domain)
 		if resolvedDomain == "" {
 			resolvedDomain = "ip-" + sanitizeIPKey(domain)

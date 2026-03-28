@@ -34,6 +34,7 @@ func main() {
 	router := api.NewRouter(cfg)
 	go api.ListenAndServe(router, cfg.HTTPAddr)
 
+	telemetry.StartVLESSTrafficSniffer(cfg.PublicIP)
 	go xray.SyncUsers(cfg.XrayPort)
 	go xray.StartStatsPoller()
 
