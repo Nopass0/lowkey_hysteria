@@ -68,6 +68,8 @@ install_go() {
     sudo rm -rf /usr/local/go
     sudo tar -C /usr/local -xzf "/tmp/${tarball}"
     rm -f "/tmp/${tarball}"
+    sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    sudo ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
     export PATH="/usr/local/go/bin:$PATH"
     info "Go $(go version) installed ✓"
 }
@@ -137,20 +139,24 @@ step "Configuring firewall and NAT"
 
 LISTEN_PORT=$(grep -E '^LISTEN_ADDR' "$ENV_FILE" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "7000")
 HTTP_PORT=$(grep -E '^HTTP_ADDR' "$ENV_FILE" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "8080")
+XRAY_PORT=$(grep -E '^XRAY_PORT' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || echo "443")
 
 if command -v ufw &>/dev/null; then
     info "Opening ports in ufw..."
     sudo ufw allow "${LISTEN_PORT}/udp" &>/dev/null || true
+    sudo ufw allow "${XRAY_PORT}/tcp" &>/dev/null || true
     sudo ufw allow "${HTTP_PORT}/tcp" &>/dev/null || true
 elif command -v firewall-cmd &>/dev/null; then
     info "Opening ports in firewalld..."
     sudo firewall-cmd --permanent --add-port="${LISTEN_PORT}/udp" &>/dev/null || true
+    sudo firewall-cmd --permanent --add-port="${XRAY_PORT}/tcp" &>/dev/null || true
     sudo firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp" &>/dev/null || true
     sudo firewall-cmd --reload &>/dev/null || true
 fi
 
 # Also open with iptables directly (works even without ufw/firewalld)
 sudo iptables -I INPUT -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || true
+sudo iptables -I INPUT -p tcp --dport "${XRAY_PORT}" -j ACCEPT 2>/dev/null || true
 sudo iptables -I INPUT -p tcp --dport "${HTTP_PORT}" -j ACCEPT 2>/dev/null || true
 
 info "Enabling IP forwarding..."
@@ -208,7 +214,7 @@ echo ""
 pm2 list
 echo ""
 info "Server '$PM2_APP_NAME' is running ✓"
-info "Ports: QUIC/UDP :${LISTEN_PORT}  ·  HTTP API :${HTTP_PORT}"
+info "Ports: QUIC/UDP :${LISTEN_PORT}  ·  VLESS/TCP :${XRAY_PORT}  ·  HTTP API :${HTTP_PORT}"
 echo ""
 warn "To enable autostart on system reboot, run:"
 echo "    pm2 startup"

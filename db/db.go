@@ -13,6 +13,7 @@ import (
 	"time"
 
 	voidorm "github.com/Nopass0/void_go"
+	"github.com/google/uuid"
 
 	"hysteria_server/config"
 )
@@ -128,6 +129,14 @@ func CountMatching(ctx context.Context, name string, q *voidorm.Query) (int64, e
 
 // Insert creates a document and returns its generated _id.
 func Insert(ctx context.Context, name string, doc voidorm.Doc) (string, error) {
+	if doc == nil {
+		doc = voidorm.Doc{}
+	}
+	if AsString(doc, "id") == "" && AsString(doc, "_id") == "" {
+		id := uuid.NewString()
+		doc["id"] = id
+		doc["_id"] = id
+	}
 	return Collection(name).Insert(ctx, doc)
 }
 
@@ -159,6 +168,12 @@ func AsString(doc voidorm.Doc, key string) string {
 		return ""
 	}
 	value, ok := doc[key]
+	if (!ok || value == nil) && key == "_id" {
+		value, ok = doc["id"]
+	}
+	if (!ok || value == nil) && key == "id" {
+		value, ok = doc["_id"]
+	}
 	if !ok || value == nil {
 		return ""
 	}
