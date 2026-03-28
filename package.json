@@ -1,0 +1,12 @@
+{
+  "name": "lowkey-hysteria-server",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "mtproto": "node ./scripts/mtproto_proxy.cjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "mtprotoproxy": "^2.0.0"
+  }
+}
