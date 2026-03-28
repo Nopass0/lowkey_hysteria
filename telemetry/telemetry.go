@@ -55,6 +55,11 @@ type vlessSnapshot struct {
 	online int64
 }
 
+type reverseDNSCacheEntry struct {
+	value     string
+	expiresAt time.Time
+}
+
 var (
 	hysteriaActive atomic.Int64
 	vlessActive    atomic.Int64
@@ -73,6 +78,9 @@ var (
 
 	vlessActiveCountMu sync.Mutex
 	lastVLESSActiveCounts = map[string]int{}
+
+	reverseDNSMu    sync.Mutex
+	reverseDNSCache = map[string]reverseDNSCacheEntry{}
 )
 
 func RegisterLoadChangeCallback(fn func()) {
@@ -343,8 +351,14 @@ func ObserveVLESSAccess(userID, serverID, serverIP, remoteAddr, destination, net
 	if port == 53 || port == 853 {
 		return
 	}
+
 	if net.ParseIP(domain) != nil {
-		return
+		resolvedDomain := resolveReverseDomain(domain)
+		if resolvedDomain == "" {
+			resolvedDomain = "ip-" + sanitizeIPKey(domain)
+		}
+		domain = resolvedDomain
+		network = strings.ToLower(network) + "+ip"
 	}
 
 	observeDomain(userID, domain, strings.ToLower(network), port, serverID, serverIP, remoteHost, now)
@@ -653,6 +667,41 @@ func observeDomain(userID, domain, network string, port int, serverID, serverIP,
 	if shouldRecordDomain {
 		upsertDomainStat(userID, domain, network, port, serverID, serverIP, remoteAddr, now)
 	}
+}
+
+func resolveReverseDomain(ip string) string {
+	now := time.Now().UTC()
+
+	reverseDNSMu.Lock()
+	cached, ok := reverseDNSCache[ip]
+	if ok && now.Before(cached.expiresAt) {
+		reverseDNSMu.Unlock()
+		return cached.value
+	}
+	reverseDNSMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
+	value := ""
+	if err == nil && len(names) > 0 {
+		value = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(names[0])), ".")
+	}
+
+	reverseDNSMu.Lock()
+	reverseDNSCache[ip] = reverseDNSCacheEntry{
+		value:     value,
+		expiresAt: now.Add(30 * time.Minute),
+	}
+	reverseDNSMu.Unlock()
+
+	return value
+}
+
+func sanitizeIPKey(ip string) string {
+	replacer := strings.NewReplacer(".", "-", ":", "-")
+	return replacer.Replace(strings.TrimSpace(ip))
 }
 
 func maxInt(v, floor int) int {
