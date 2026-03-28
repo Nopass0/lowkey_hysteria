@@ -1,15 +1,19 @@
 package xray
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"text/template"
 	"time"
 
@@ -33,9 +37,19 @@ const xrayConfigTmpl = `
   "stats": {},
   "api": {
     "tag": "api",
-    "listen": "127.0.0.1:10085",
     "services": [
       "StatsService"
+    ]
+  },
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
+      }
     ]
   },
   "policy": {
@@ -49,6 +63,16 @@ const xrayConfigTmpl = `
   },
   "inbounds": [
     {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "vless-in",
       "port": {{.Port}},
       "protocol": "vless",
       "settings": {
@@ -63,6 +87,14 @@ const xrayConfigTmpl = `
           {{end}}
         ],
         "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
       },
       "streamSettings": {
         "network": "tcp",
@@ -146,6 +178,7 @@ func SyncUsers(port int) {
 func StartStatsPoller() {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
+	lastUsers := map[string]struct{}{}
 
 	for range ticker.C {
 		stats, err := queryStats()
@@ -162,7 +195,7 @@ func StartStatsPoller() {
 
 		perUser := map[string]*userAgg{}
 		totalOnline := int64(0)
-		sawOnline := false
+		sawOnlineStat := false
 
 		for _, item := range stats.Stat {
 			if m := trafficStatRe.FindStringSubmatch(item.Name); m != nil {
@@ -185,16 +218,30 @@ func StartStatsPoller() {
 				}
 				perUser[userID].online = item.IntValue()
 				totalOnline += item.IntValue()
-				sawOnline = true
+				sawOnlineStat = true
 			}
 		}
 
+		if !sawOnlineStat {
+			for userID, agg := range perUser {
+				telemetry.ApplyVLESSUserTraffic(userID, heartbeat.ServerID(), agg.up, agg.down)
+			}
+			telemetry.SyncVLESSSessionCountsFromDB(heartbeat.ServerID())
+			continue
+		}
+
+		currentUsers := make(map[string]struct{}, len(perUser))
 		for userID, agg := range perUser {
+			currentUsers[userID] = struct{}{}
 			telemetry.ApplyVLESSUserSnapshot(userID, heartbeat.ServerID(), agg.up, agg.down, agg.online)
 		}
-		if sawOnline {
-			telemetry.SetVLESSActive(totalOnline)
+		for userID := range lastUsers {
+			if _, ok := currentUsers[userID]; !ok {
+				telemetry.ResetVLESSUserActive(userID, heartbeat.ServerID())
+			}
 		}
+		lastUsers = currentUsers
+		telemetry.SetVLESSActive(totalOnline)
 	}
 }
 
@@ -230,12 +277,20 @@ func restartXray(users []string, port int) error {
 	}
 
 	cmd = exec.Command("xray", "run", "-c", "xray_config.json")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
 
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	go streamXrayOutput(stdout, false)
+	go streamXrayOutput(stderr, true)
 	log.Printf("[Xray] Started new xray process with PID %d", cmd.Process.Pid)
 	return nil
 }
@@ -245,13 +300,32 @@ type statsResponse struct {
 }
 
 type statsItem struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name  string          `json:"name"`
+	Value json.RawMessage `json:"value"`
 }
 
 func (s statsItem) IntValue() int64 {
-	n, _ := strconv.ParseInt(s.Value, 10, 64)
-	return n
+	if len(s.Value) == 0 {
+		return 0
+	}
+	if s.Value[0] == '"' {
+		var value string
+		if err := json.Unmarshal(s.Value, &value); err == nil {
+			n, _ := strconv.ParseInt(value, 10, 64)
+			return n
+		}
+		return 0
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(s.Value, &number); err == nil {
+		n, _ := number.Int64()
+		return n
+	}
+
+	var fallback int64
+	_ = json.Unmarshal(s.Value, &fallback)
+	return fallback
 }
 
 func queryStats() (*statsResponse, error) {
@@ -268,4 +342,72 @@ func queryStats() (*statsResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+func streamXrayOutput(reader io.Reader, isErr bool) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isErr {
+			fmt.Fprintln(os.Stderr, line)
+		} else {
+			fmt.Fprintln(os.Stdout, line)
+		}
+
+		userID, remoteAddr, network, destination, ok := parseAccessLogLine(line)
+		if ok {
+			telemetry.ObserveVLESSAccess(
+				userID,
+				heartbeat.ServerID(),
+				heartbeat.ServerIP(),
+				remoteAddr,
+				destination,
+				network,
+			)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Xray] Output stream error: %v", err)
+	}
+}
+
+func parseAccessLogLine(line string) (userID, remoteAddr, network, destination string, ok bool) {
+	fromIndex := strings.Index(line, "from ")
+	if fromIndex == -1 {
+		return "", "", "", "", false
+	}
+	acceptedIndex := strings.Index(line[fromIndex+5:], " accepted ")
+	if acceptedIndex == -1 {
+		return "", "", "", "", false
+	}
+	acceptedIndex += fromIndex + 5
+
+	emailIndex := strings.LastIndex(line, " email: ")
+	if emailIndex == -1 || emailIndex <= acceptedIndex {
+		return "", "", "", "", false
+	}
+
+	remoteAddr = strings.TrimSpace(line[fromIndex+5 : acceptedIndex])
+	remoteAddr = strings.TrimPrefix(strings.TrimPrefix(remoteAddr, "tcp:"), "udp:")
+	userID = strings.TrimSpace(line[emailIndex+8:])
+	if userID == "" {
+		return "", "", "", "", false
+	}
+
+	destPart := strings.TrimSpace(line[acceptedIndex+10 : emailIndex])
+	colonIndex := strings.Index(destPart, ":")
+	if colonIndex == -1 {
+		return "", "", "", "", false
+	}
+
+	network = strings.TrimSpace(destPart[:colonIndex])
+	destination = strings.TrimSpace(destPart[colonIndex+1:])
+	if network == "" || destination == "" {
+		return "", "", "", "", false
+	}
+
+	return userID, remoteAddr, network, destination, true
 }

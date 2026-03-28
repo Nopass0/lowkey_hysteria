@@ -2,7 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"log"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +20,11 @@ import (
 const (
 	sessionsCollection      = "vpn_sessions"
 	userProtocolCollection  = "vpn_user_protocol_stats"
+	domainStatsCollection   = "vpn_domain_stats"
 	flushInterval           = 5 * time.Second
+	vlessTouchInterval      = 20 * time.Second
+	vlessDomainMinInterval  = 15 * time.Second
+	vlessSessionStaleWindow = 5 * time.Minute
 )
 
 type SessionInfo struct {
@@ -55,6 +64,15 @@ var (
 
 	vlessMu       sync.Mutex
 	lastVLESSByUser = map[string]vlessSnapshot{}
+
+	vlessSessionMu    sync.Mutex
+	lastVLESSSessionTouch = map[string]time.Time{}
+
+	vlessDomainMu    sync.Mutex
+	lastVLESSDomainTouch = map[string]time.Time{}
+
+	vlessActiveCountMu sync.Mutex
+	lastVLESSActiveCounts = map[string]int{}
 )
 
 func RegisterLoadChangeCallback(fn func()) {
@@ -79,6 +97,88 @@ func TotalLoad() int {
 func SetVLESSActive(n int64) {
 	vlessActive.Store(n)
 	notifyLoadChanged()
+}
+
+func ResetVLESSUserActive(userID, serverID string) {
+	vlessMu.Lock()
+	prev := lastVLESSByUser[userID]
+	lastVLESSByUser[userID] = vlessSnapshot{
+		up:     prev.up,
+		down:   prev.down,
+		online: 0,
+	}
+	vlessMu.Unlock()
+
+	applyUserProtocolSnapshot(userID, "vless", 0, 0, 0, 0, "", serverID)
+}
+
+func ApplyVLESSUserTraffic(userID, serverID string, up, down int64) {
+	vlessMu.Lock()
+	prev := lastVLESSByUser[userID]
+	deltaUp := up
+	deltaDown := down
+	if up >= prev.up {
+		deltaUp = up - prev.up
+	}
+	if down >= prev.down {
+		deltaDown = down - prev.down
+	}
+	lastVLESSByUser[userID] = vlessSnapshot{
+		up:     up,
+		down:   down,
+		online: prev.online,
+	}
+	vlessMu.Unlock()
+
+	applyUserProtocolTrafficDelta(userID, "vless", deltaUp, deltaDown, serverID)
+}
+
+func SyncVLESSSessionCountsFromDB(serverID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	rows, err := db.FindMany(
+		ctx,
+		sessionsCollection,
+		voidorm.NewQuery().
+			Where("protocol", voidorm.Eq, "vless").
+			Where("status", voidorm.Eq, "active").
+			Where("lastSeenAt", voidorm.Gte, time.Now().UTC().Add(-vlessSessionStaleWindow)),
+	)
+	if err != nil {
+		log.Printf("[Telemetry] Failed to sync VLESS session counts: %v", err)
+		return
+	}
+
+	counts := make(map[string]int, len(rows))
+	for _, row := range rows {
+		userID := db.AsString(row, "userId")
+		if userID == "" {
+			continue
+		}
+		counts[userID]++
+	}
+
+	totalActive := 0
+	for _, count := range counts {
+		totalActive += count
+	}
+
+	vlessActiveCountMu.Lock()
+	previous := lastVLESSActiveCounts
+	lastVLESSActiveCounts = counts
+	vlessActiveCountMu.Unlock()
+
+	for userID, count := range counts {
+		applyUserProtocolSnapshot(userID, "vless", count, 0, 0, 0, "", serverID)
+	}
+	for userID := range previous {
+		if _, ok := counts[userID]; !ok {
+			ResetVLESSUserActive(userID, serverID)
+		}
+	}
+
+	SetVLESSActive(int64(totalActive))
 }
 
 func StartHysteriaSession(info SessionInfo) *SessionTracker {
@@ -205,6 +305,64 @@ func ApplyVLESSUserSnapshot(userID, serverID string, up, down, online int64) {
 	applyUserProtocolSnapshot(userID, "vless", int(online), sessionDelta, deltaUp, deltaDown, "", serverID)
 }
 
+func ObserveVLESSAccess(userID, serverID, serverIP, remoteAddr, destination, network string) {
+	if userID == "" {
+		return
+	}
+
+	now := time.Now().UTC()
+	remoteHost := normalizeRemoteHost(remoteAddr)
+	if remoteHost != "" {
+		sessionKey := userID + "|" + serverID + "|" + remoteHost
+		shouldTouch := false
+
+		vlessSessionMu.Lock()
+		lastTouch, ok := lastVLESSSessionTouch[sessionKey]
+		if !ok || now.Sub(lastTouch) >= vlessTouchInterval {
+			lastVLESSSessionTouch[sessionKey] = now
+			shouldTouch = true
+		}
+		vlessSessionMu.Unlock()
+
+		if shouldTouch {
+			sessionID := stableID("vless-session", userID, serverID, remoteHost)
+			upsertVLESSSession(sessionID, SessionInfo{
+				UserID:     userID,
+				Protocol:   "vless",
+				ServerID:   serverID,
+				ServerIP:   serverIP,
+				RemoteAddr: remoteHost,
+			}, now)
+		}
+	}
+
+	domain, port := normalizeDestination(destination)
+	if domain == "" {
+		return
+	}
+	if port == 53 || port == 853 {
+		return
+	}
+	if net.ParseIP(domain) != nil {
+		return
+	}
+
+	domainKey := userID + "|" + domain
+	shouldRecordDomain := false
+
+	vlessDomainMu.Lock()
+	lastTouch, ok := lastVLESSDomainTouch[domainKey]
+	if !ok || now.Sub(lastTouch) >= vlessDomainMinInterval {
+		lastVLESSDomainTouch[domainKey] = now
+		shouldRecordDomain = true
+	}
+	vlessDomainMu.Unlock()
+
+	if shouldRecordDomain {
+		upsertDomainStat(userID, domain, network, now)
+	}
+}
+
 func applyUserProtocolDelta(userID, protocol string, activeDelta, sessionDelta int, bytesUpDelta, bytesDownDelta int64, deviceID, serverID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -309,6 +467,173 @@ func applyUserProtocolSnapshot(userID, protocol string, activeConnections, sessi
 	}
 	if _, err = db.Patch(ctx, userProtocolCollection, db.AsString(row, "_id"), patch); err != nil {
 		log.Printf("[Telemetry] Failed to patch VLESS stats: %v", err)
+	}
+}
+
+func applyUserProtocolTrafficDelta(userID, protocol string, bytesUpDelta, bytesDownDelta int64, serverID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	row, err := db.FindOne(
+		ctx,
+		userProtocolCollection,
+		voidorm.NewQuery().
+			Where("userId", voidorm.Eq, userID).
+			Where("protocol", voidorm.Eq, protocol),
+	)
+	if err != nil {
+		_, insertErr := db.Insert(ctx, userProtocolCollection, voidorm.Doc{
+			"userId":            userID,
+			"protocol":          protocol,
+			"sessionCount":      0,
+			"activeConnections": 0,
+			"totalBytesUp":      bytesUpDelta,
+			"totalBytesDown":    bytesDownDelta,
+			"lastSeenAt":        time.Now().UTC(),
+			"lastServerId":      serverID,
+		})
+		if insertErr != nil {
+			log.Printf("[Telemetry] Failed to insert VLESS traffic stats: %v", insertErr)
+		}
+		return
+	}
+
+	patch := voidorm.Doc{
+		"totalBytesUp":   int64(db.AsFloat64(row, "totalBytesUp")) + bytesUpDelta,
+		"totalBytesDown": int64(db.AsFloat64(row, "totalBytesDown")) + bytesDownDelta,
+		"lastSeenAt":     time.Now().UTC(),
+	}
+	if serverID != "" {
+		patch["lastServerId"] = serverID
+	}
+	if _, err = db.Patch(ctx, userProtocolCollection, db.AsString(row, "_id"), patch); err != nil {
+		log.Printf("[Telemetry] Failed to patch VLESS traffic stats: %v", err)
+	}
+}
+
+func stableID(parts ...string) string {
+	sum := sha1.Sum([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizeRemoteHost(value string) string {
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "tcp:"), "udp:"))
+	if raw == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	if strings.Count(raw, ":") == 1 {
+		if host, _, err := net.SplitHostPort(raw); err == nil {
+			return strings.Trim(host, "[]")
+		}
+	}
+	return strings.Trim(raw, "[]")
+}
+
+func normalizeDestination(value string) (string, int) {
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(value, "tcp:"), "udp:"))
+	if raw == "" {
+		return "", 0
+	}
+
+	if host, port, err := net.SplitHostPort(raw); err == nil {
+		n, _ := strconv.Atoi(port)
+		return strings.Trim(strings.ToLower(host), "[]"), n
+	}
+
+	lastColon := strings.LastIndex(raw, ":")
+	if lastColon <= 0 || lastColon >= len(raw)-1 {
+		return strings.Trim(strings.ToLower(raw), "[]"), 0
+	}
+	port, _ := strconv.Atoi(raw[lastColon+1:])
+	host := raw[:lastColon]
+	return strings.Trim(strings.ToLower(host), "[]"), port
+}
+
+func upsertVLESSSession(sessionID string, info SessionInfo, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	row, err := db.FindByID(ctx, sessionsCollection, sessionID)
+	if err == nil {
+		_, patchErr := db.Patch(ctx, sessionsCollection, sessionID, voidorm.Doc{
+			"status":     "active",
+			"lastSeenAt": now,
+			"serverId":   info.ServerID,
+			"serverIp":   info.ServerIP,
+			"remoteAddr": info.RemoteAddr,
+			"protocol":   info.Protocol,
+		})
+		if patchErr != nil {
+			log.Printf("[Telemetry] Failed to touch VLESS session %s: %v", sessionID, patchErr)
+		}
+		_ = row
+		return
+	}
+
+	if err != db.ErrNotFound {
+		log.Printf("[Telemetry] Failed to fetch VLESS session %s: %v", sessionID, err)
+		return
+	}
+
+	_, insertErr := db.Insert(ctx, sessionsCollection, voidorm.Doc{
+		"id":           sessionID,
+		"_id":          sessionID,
+		"userId":       info.UserID,
+		"protocol":     info.Protocol,
+		"serverId":     info.ServerID,
+		"serverIp":     info.ServerIP,
+		"remoteAddr":   info.RemoteAddr,
+		"status":       "active",
+		"connectedAt":  now,
+		"lastSeenAt":   now,
+		"bytesUp":      int64(0),
+		"bytesDown":    int64(0),
+	})
+	if insertErr != nil {
+		log.Printf("[Telemetry] Failed to insert VLESS session %s: %v", sessionID, insertErr)
+	}
+}
+
+func upsertDomainStat(userID, domain, network string, now time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	row, err := db.FindOne(
+		ctx,
+		domainStatsCollection,
+		voidorm.NewQuery().
+			Where("userId", voidorm.Eq, userID).
+			Where("domain", voidorm.Eq, domain),
+	)
+	if err != nil {
+		if err != db.ErrNotFound {
+			log.Printf("[Telemetry] Failed to query domain stat %s for %s: %v", domain, userID, err)
+			return
+		}
+
+		_, insertErr := db.Insert(ctx, domainStatsCollection, voidorm.Doc{
+			"userId":          userID,
+			"domain":          domain,
+			"visitCount":      1,
+			"bytesTransferred": int64(0),
+			"firstVisitAt":    now,
+			"lastVisitAt":     now,
+		})
+		if insertErr != nil {
+			log.Printf("[Telemetry] Failed to insert domain stat %s for %s: %v", domain, userID, insertErr)
+		}
+		return
+	}
+
+	_, patchErr := db.Patch(ctx, domainStatsCollection, db.AsString(row, "_id"), voidorm.Doc{
+		"visitCount":  db.AsInt(row, "visitCount") + 1,
+		"lastVisitAt": now,
+	})
+	if patchErr != nil {
+		log.Printf("[Telemetry] Failed to patch domain stat %s for %s: %v", domain, userID, patchErr)
 	}
 }
 

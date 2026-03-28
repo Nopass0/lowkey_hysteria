@@ -20,6 +20,7 @@ import (
 
 var (
 	serverID string
+	serverIP string
 	serverMu sync.RWMutex
 )
 
@@ -29,13 +30,35 @@ func ServerID() string {
 	return serverID
 }
 
+func ServerIP() string {
+	serverMu.RLock()
+	defer serverMu.RUnlock()
+	return serverIP
+}
+
+func shouldRefreshConnectLink(existing, generated, connectHost string) bool {
+	if strings.TrimSpace(existing) == "" {
+		return true
+	}
+	if !strings.Contains(existing, connectHost) {
+		return true
+	}
+	if strings.Contains(existing, "security=reality") && !strings.Contains(existing, "flow=xtls-rprx-vision") {
+		return true
+	}
+	if !strings.Contains(existing, "pbk=") || !strings.Contains(existing, "sid=") {
+		return true
+	}
+	return false
+}
+
 func RegisterServer(cfg *config.Config, location string) {
 	protocols := []string{"hysteria2", "vless"}
 	connectHost := cfg.PublicHostname
 	if connectHost == "" {
 		connectHost = cfg.PublicIP
 	}
-	connectLink := "vless://{uuid}@" + connectHost + ":" + strconv.Itoa(cfg.XrayPort) + "?encryption=none&security=reality&sni=google.com&fp=chrome&pbk=4kh0XQFo3wcPOnAU-o_Nokc3WQGWUVQEPQBurWHxUBM&sid=e12b6c973e573780&type=tcp&headerType=none#lowkey-" + location
+	connectLink := "vless://{uuid}@" + connectHost + ":" + strconv.Itoa(cfg.XrayPort) + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=google.com&fp=chrome&pbk=4kh0XQFo3wcPOnAU-o_Nokc3WQGWUVQEPQBurWHxUBM&sid=e12b6c973e573780&type=tcp&headerType=none#lowkey-" + location
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -61,7 +84,7 @@ func RegisterServer(cfg *config.Config, location string) {
 			if db.AsString(doc, "serverType") == "" {
 				patch["serverType"] = "hybrid"
 			}
-			if db.AsString(doc, "connectLinkTemplate") == "" {
+			if shouldRefreshConnectLink(db.AsString(doc, "connectLinkTemplate"), connectLink, connectHost) {
 				patch["connectLinkTemplate"] = connectLink
 			}
 			_, err = db.Patch(ctx, "vpn_servers", id, patch)
@@ -69,6 +92,7 @@ func RegisterServer(cfg *config.Config, location string) {
 			if err == nil {
 				serverMu.Lock()
 				serverID = id
+				serverIP = cfg.PublicIP
 				serverMu.Unlock()
 				log.Printf("[Heartbeat] Server registered in VoidDB, ID=%s, location=%s", id, location)
 				return
@@ -91,6 +115,7 @@ func RegisterServer(cfg *config.Config, location string) {
 			if insertErr == nil {
 				serverMu.Lock()
 				serverID = id
+				serverIP = cfg.PublicIP
 				serverMu.Unlock()
 				log.Printf("[Heartbeat] Server created in VoidDB, ID=%s, location=%s", id, location)
 				return
