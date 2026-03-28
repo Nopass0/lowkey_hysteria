@@ -359,7 +359,7 @@ func ObserveVLESSAccess(userID, serverID, serverIP, remoteAddr, destination, net
 	vlessDomainMu.Unlock()
 
 	if shouldRecordDomain {
-		upsertDomainStat(userID, domain, network, now)
+		upsertDomainStat(userID, domain, strings.ToLower(network), port, serverID, serverIP, remoteHost, now)
 	}
 }
 
@@ -597,7 +597,7 @@ func upsertVLESSSession(sessionID string, info SessionInfo, now time.Time) {
 	}
 }
 
-func upsertDomainStat(userID, domain, network string, now time.Time) {
+func upsertDomainStat(userID, domain, network string, port int, serverID, serverIP, remoteAddr string, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -615,12 +615,17 @@ func upsertDomainStat(userID, domain, network string, now time.Time) {
 		}
 
 		_, insertErr := db.Insert(ctx, domainStatsCollection, voidorm.Doc{
-			"userId":          userID,
-			"domain":          domain,
-			"visitCount":      1,
+			"userId":           userID,
+			"domain":           domain,
+			"visitCount":       1,
 			"bytesTransferred": int64(0),
-			"firstVisitAt":    now,
-			"lastVisitAt":     now,
+			"firstVisitAt":     now,
+			"lastVisitAt":      now,
+			"lastNetwork":      network,
+			"lastPort":         port,
+			"lastRemoteAddr":   remoteAddr,
+			"lastServerId":     serverID,
+			"lastServerIp":     serverIP,
 		})
 		if insertErr != nil {
 			log.Printf("[Telemetry] Failed to insert domain stat %s for %s: %v", domain, userID, insertErr)
@@ -629,8 +634,13 @@ func upsertDomainStat(userID, domain, network string, now time.Time) {
 	}
 
 	_, patchErr := db.Patch(ctx, domainStatsCollection, db.AsString(row, "_id"), voidorm.Doc{
-		"visitCount":  db.AsInt(row, "visitCount") + 1,
-		"lastVisitAt": now,
+		"visitCount":     db.AsInt(row, "visitCount") + 1,
+		"lastVisitAt":    now,
+		"lastNetwork":    network,
+		"lastPort":       port,
+		"lastRemoteAddr": remoteAddr,
+		"lastServerId":   serverID,
+		"lastServerIp":   serverIP,
 	})
 	if patchErr != nil {
 		log.Printf("[Telemetry] Failed to patch domain stat %s for %s: %v", domain, userID, patchErr)

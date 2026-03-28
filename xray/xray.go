@@ -350,12 +350,6 @@ func streamXrayOutput(reader io.Reader, isErr bool) {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if isErr {
-			fmt.Fprintln(os.Stderr, line)
-		} else {
-			fmt.Fprintln(os.Stdout, line)
-		}
-
 		userID, remoteAddr, network, destination, ok := parseAccessLogLine(line)
 		if ok {
 			telemetry.ObserveVLESSAccess(
@@ -366,6 +360,17 @@ func streamXrayOutput(reader io.Reader, isErr bool) {
 				destination,
 				network,
 			)
+			continue
+		}
+
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		if isErr {
+			fmt.Fprintln(os.Stderr, line)
+		} else {
+			fmt.Fprintln(os.Stdout, line)
 		}
 	}
 
