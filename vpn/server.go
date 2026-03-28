@@ -182,6 +182,13 @@ func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 		n, err := r.Body.Read(buf)
 		if n > 0 {
 			session.AddBytesUp(n)
+			telemetry.ObserveHysteriaPacket(
+				authRes.UserID,
+				heartbeat.ServerID(),
+				cfg.PublicIP,
+				addrStr,
+				buf[:n],
+			)
 			if tun.Device != nil {
 				if _, werr := tun.Device.Write(buf[:n]); werr != nil {
 					log.Printf("[VPN] TUN write error: %v", werr)

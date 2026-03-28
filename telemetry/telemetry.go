@@ -68,8 +68,8 @@ var (
 	vlessSessionMu    sync.Mutex
 	lastVLESSSessionTouch = map[string]time.Time{}
 
-	vlessDomainMu    sync.Mutex
-	lastVLESSDomainTouch = map[string]time.Time{}
+	domainTouchMu    sync.Mutex
+	lastDomainTouch = map[string]time.Time{}
 
 	vlessActiveCountMu sync.Mutex
 	lastVLESSActiveCounts = map[string]int{}
@@ -347,20 +347,7 @@ func ObserveVLESSAccess(userID, serverID, serverIP, remoteAddr, destination, net
 		return
 	}
 
-	domainKey := userID + "|" + domain
-	shouldRecordDomain := false
-
-	vlessDomainMu.Lock()
-	lastTouch, ok := lastVLESSDomainTouch[domainKey]
-	if !ok || now.Sub(lastTouch) >= vlessDomainMinInterval {
-		lastVLESSDomainTouch[domainKey] = now
-		shouldRecordDomain = true
-	}
-	vlessDomainMu.Unlock()
-
-	if shouldRecordDomain {
-		upsertDomainStat(userID, domain, strings.ToLower(network), port, serverID, serverIP, remoteHost, now)
-	}
+	observeDomain(userID, domain, strings.ToLower(network), port, serverID, serverIP, remoteHost, now)
 }
 
 func applyUserProtocolDelta(userID, protocol string, activeDelta, sessionDelta int, bytesUpDelta, bytesDownDelta int64, deviceID, serverID string) {
@@ -644,6 +631,27 @@ func upsertDomainStat(userID, domain, network string, port int, serverID, server
 	})
 	if patchErr != nil {
 		log.Printf("[Telemetry] Failed to patch domain stat %s for %s: %v", domain, userID, patchErr)
+	}
+}
+
+func observeDomain(userID, domain, network string, port int, serverID, serverIP, remoteAddr string, now time.Time) {
+	if userID == "" || domain == "" {
+		return
+	}
+
+	domainKey := userID + "|" + domain
+	shouldRecordDomain := false
+
+	domainTouchMu.Lock()
+	lastTouch, ok := lastDomainTouch[domainKey]
+	if !ok || now.Sub(lastTouch) >= vlessDomainMinInterval {
+		lastDomainTouch[domainKey] = now
+		shouldRecordDomain = true
+	}
+	domainTouchMu.Unlock()
+
+	if shouldRecordDomain {
+		upsertDomainStat(userID, domain, network, port, serverID, serverIP, remoteAddr, now)
 	}
 }
 
