@@ -1,8 +1,31 @@
 "use strict";
 
+const fs = require("fs");
 const net = require("net");
 const path = require("path");
 const dotenv = require("dotenv");
+
+function patchMtprotoProxyModule() {
+  const modulePath = require.resolve("mtprotoproxy");
+  const source = fs.readFileSync(modulePath, "utf8");
+
+  let patched = source.replace(
+    /AD_TAG=Buffer\.from\(AD_TAG,'hex'\)/g,
+    "AD_TAG=Buffer.from(AD_TAG||'','hex')",
+  );
+
+  patched = patched.replace(
+    /assertit\(dcId>=-5\);\s*assertit\(dcId<=5\);\s*assertit\(dcId!==0\);/g,
+    "assertit(dc[dcId]&&dc[dcId].length>0,'Unknown dcId');",
+  );
+
+  if (patched !== source) {
+    fs.writeFileSync(modulePath, patched, "utf8");
+  }
+}
+
+patchMtprotoProxyModule();
+
 const { MTProtoProxy } = require("mtprotoproxy");
 
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
