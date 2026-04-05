@@ -88,6 +88,38 @@ else
     install_node
 fi
 
+step "Checking Xray installation"
+
+install_xray() {
+    local arch zipball url
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) arch="64" ;;
+        aarch64|arm64) arch="arm64-v8a" ;;
+        armv6l) arch="arm32-v6a" ;;
+        *) error "Unsupported CPU architecture for Xray: $arch" ;;
+    esac
+
+    zipball="Xray-linux-${arch}.zip"
+    url="https://github.com/XTLS/Xray-core/releases/latest/download/${zipball}"
+
+    info "Installing latest Xray-core..."
+    curl -fsSL -L "$url" -o "/tmp/${zipball}"
+    if ! command -v unzip >/dev/null 2>&1; then
+        sudo apt-get update -y && sudo apt-get install -y unzip
+    fi
+    sudo unzip -o "/tmp/${zipball}" xray -d /usr/local/bin/
+    sudo chmod +x /usr/local/bin/xray
+    rm -f "/tmp/${zipball}"
+}
+
+if command -v xray >/dev/null 2>&1; then
+    info "Xray $(xray -version | head -n1) is installed"
+else
+    warn "Xray not found, installing"
+    install_xray
+fi
+
 step "Checking PM2 installation"
 
 if command -v pm2 >/dev/null 2>&1; then

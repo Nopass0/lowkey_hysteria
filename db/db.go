@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,10 +57,29 @@ func Init(cfg *config.Config) {
 		}
 
 		if _, err = client.ListDatabases(ctx); err != nil {
-			cancel()
-			log.Printf("[VoidDB] Connectivity check failed: %v, retrying in 5s...", err)
-			time.Sleep(5 * time.Second)
-			continue
+			if cfg.VoidDBToken != "" && canFallbackToPasswordLogin(cfg) && isAuthFailure(err) {
+				cancel()
+				log.Printf("[VoidDB] Token auth failed: %v, trying username/password login...", err)
+
+				ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+				if _, err = client.Login(ctx, cfg.VoidDBUsername, cfg.VoidDBPassword); err != nil {
+					cancel()
+					log.Printf("[VoidDB] Login fallback failed: %v, retrying in 5s...", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				if _, err = client.ListDatabases(ctx); err != nil {
+					cancel()
+					log.Printf("[VoidDB] Connectivity check failed after login fallback: %v, retrying in 5s...", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+			} else {
+				cancel()
+				log.Printf("[VoidDB] Connectivity check failed: %v, retrying in 5s...", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
 		}
 		cancel()
 
@@ -67,6 +87,22 @@ func Init(cfg *config.Config) {
 		log.Println("[VoidDB] Connected successfully")
 		return
 	}
+}
+
+func canFallbackToPasswordLogin(cfg *config.Config) bool {
+	return cfg.VoidDBUsername != "" && cfg.VoidDBPassword != ""
+}
+
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "401") ||
+		strings.Contains(msg, "403") ||
+		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "invalid or expired token")
 }
 
 // EnsureInit is a defensive wrapper for call sites that may be reached before
