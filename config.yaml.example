@@ -1,0 +1,58 @@
+# Lowkey VPN Hysteria2 server configuration
+# Copy to config.yaml and fill in your values.
+# All fields can also be set via environment variables (see config/config.go).
+
+# VoidDB connection (same as backend VOIDDB_* env vars)
+voiddb_url: "http://voiddb:4000"
+voiddb_username: "admin"
+voiddb_password: "changeme"
+# voiddb_token: ""  # use token OR username+password
+
+# Central backend API URL
+backend_url: "https://lowkey.su/api"
+backend_secret: "your-server-secret-here"  # X-Server-Secret header
+tls_cache_dir: "./tls-cache"
+
+# Server identity
+server_ip: "1.2.3.4"          # public IP of this server
+server_hostname: "s1.lowkey.su"
+# server_id: ""               # set automatically on first register
+
+# Hysteria2 TLS
+listen: "0.0.0.0:443"
+# cert_file/key_file are optional. If omitted, the node fetches TLS material
+# for server_hostname from the backend and stores it in tls_cache_dir.
+# cert_file: "/etc/ssl/certs/server.crt"
+# key_file:  "/etc/ssl/private/server.key"
+# obfs: "your-obfs-password"  # optional Salamander obfuscation
+bandwidth_up:   1000  # Mbps
+bandwidth_down: 1000  # Mbps
+
+# ── Captive portal ───────────────────────────────────────────────────────────
+captive_portal_url: "https://lowkey.su"
+
+# HTTP captive portal (port 80): intercepts HTTP requests and redirects to billing
+captive_portal_listen: "0.0.0.0:8080"
+
+# HTTPS captive portal: serves TLS redirect page (uses same cert as Hysteria2)
+# Users hitting HTTPS sites get redirected to billing page (with cert mismatch for
+# the target domain — standard captive portal behaviour, same as hotel WiFi)
+captive_https_listen: "0.0.0.0:8443"
+
+# DNS captive portal: hijacks DNS for expired users so both HTTP and HTTPS
+# traffic reaches the captive portal IP instead of the real destination
+captive_ip: "1.2.3.4"          # this server's public IP
+dns_listen: "0.0.0.0:53"       # listen for DNS queries from VPN clients
+upstream_dns: "8.8.8.8:53"     # forward non-expired queries here
+
+# Domain statistics flush interval (seconds)
+domain_flush_interval: 60
+
+# MTProto proxy for Telegram
+mtproto_enabled: false
+mtproto_listen: "0.0.0.0:8443"
+# Generate a secret with: ./hysteria-server -gen-mtproto-secret
+# Prefix "dd" enables fake-TLS camouflage (recommended)
+mtproto_secret: "dd0123456789abcdef0123456789abcdef"
+mtproto_channel: "@lowkeyvpnbot"   # advertised bot/channel username (optional)
+mtproto_add_channel: false
