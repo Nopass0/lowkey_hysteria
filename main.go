@@ -4,6 +4,7 @@ import (
 	"log"
 
 	"hysteria_server/api"
+	"hysteria_server/blocklist"
 	"hysteria_server/config"
 	"hysteria_server/db"
 	"hysteria_server/heartbeat"
@@ -29,6 +30,9 @@ func main() {
 	heartbeat.StartHeartbeatDB()
 	heartbeat.StartServerMonitor()
 
+	bl := blocklist.New(cfg)
+	defer bl.Stop()
+
 	tun.Init()
 
 	router := api.NewRouter(cfg)
@@ -38,5 +42,5 @@ func main() {
 	go xray.SyncUsers(cfg.XrayPort)
 	go xray.StartStatsPoller()
 
-	vpn.ListenAndServe(cfg)
+	vpn.ListenAndServe(cfg, bl)
 }

@@ -227,10 +227,10 @@ func handleCapturedVLESSTCPPacket(
 	domain := ""
 	network := pending.network
 
-	if parsed := extractHTTPHost(payload); parsed != "" {
+	if parsed := ExtractHTTPHost(payload); parsed != "" {
 		domain = parsed
 		network = "http-sniff"
-	} else if parsed := extractTLSServerName(payload); parsed != "" {
+	} else if parsed := ExtractTLSServerName(payload); parsed != "" {
 		domain = parsed
 		network = "tls-sniff"
 	}

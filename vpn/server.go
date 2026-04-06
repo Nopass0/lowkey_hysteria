@@ -12,6 +12,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 
 	"hysteria_server/auth"
+	"hysteria_server/blocklist"
 	"hysteria_server/config"
 	"hysteria_server/heartbeat"
 	"hysteria_server/telemetry"
@@ -80,7 +81,7 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func ListenAndServe(cfg *config.Config) {
+func ListenAndServe(cfg *config.Config, bl *blocklist.Manager) {
 	cert, err := loadTLSCertificate(cfg)
 	if err != nil {
 		log.Fatalf("[VPN] TLS cert error: %v", err)
@@ -94,7 +95,7 @@ func ListenAndServe(cfg *config.Config) {
 
 	handler := http.NewServeMux()
 	handler.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
-		handleTunnel(w, r, cfg)
+		handleTunnel(w, r, cfg, bl)
 	})
 
 	server := http3.Server{
@@ -109,7 +110,7 @@ func ListenAndServe(cfg *config.Config) {
 	}
 }
 
-func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
+func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config, bl *blocklist.Manager) {
 	addrStr := r.RemoteAddr
 	log.Printf("[VPN] New HTTP/3 tunnel request from %s", addrStr)
 
@@ -189,6 +190,9 @@ func handleTunnel(w http.ResponseWriter, r *http.Request, cfg *config.Config) {
 				addrStr,
 				buf[:n],
 			)
+			if maybeHandleBlockedPacket(pw, buf[:n], bl) {
+				continue
+			}
 			if tun.Device != nil {
 				if _, werr := tun.Device.Write(buf[:n]); werr != nil {
 					log.Printf("[VPN] TUN write error: %v", werr)

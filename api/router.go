@@ -52,6 +52,7 @@ func NewRouter(cfg *config.Config) http.Handler {
 			"service": "lowkey-vpn-go-api",
 		})
 	})
+	mux.HandleFunc("GET /blocked", h.blockedPage)
 
 	mux.HandleFunc("GET /api/servers/list", h.getServers)
 

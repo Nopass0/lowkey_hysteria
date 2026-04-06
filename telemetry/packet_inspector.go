@@ -38,7 +38,7 @@ func observeHysteriaUDPPacket(userID, serverID, serverIP, remoteAddr string, pac
 		return
 	}
 
-	domain := extractDNSQueryName(packet[8:])
+	domain := ExtractDNSQueryName(packet[8:])
 	if domain == "" {
 		return
 	}
@@ -64,17 +64,17 @@ func observeHysteriaTCPPacket(userID, serverID, serverIP, remoteAddr string, pac
 
 	switch dstPort {
 	case 80, 8080, 8000:
-		if domain := extractHTTPHost(payload); domain != "" {
+		if domain := ExtractHTTPHost(payload); domain != "" {
 			observeDomain(userID, domain, "http", dstPort, serverID, serverIP, remoteAddr, now)
 		}
 	case 443, 8443:
-		if domain := extractTLSServerName(payload); domain != "" {
+		if domain := ExtractTLSServerName(payload); domain != "" {
 			observeDomain(userID, domain, "tls", dstPort, serverID, serverIP, remoteAddr, now)
 		}
 	}
 }
 
-func extractDNSQueryName(message []byte) string {
+func ExtractDNSQueryName(message []byte) string {
 	var parser dnsmessage.Parser
 	if _, err := parser.Start(message); err != nil {
 		return ""
@@ -88,7 +88,7 @@ func extractDNSQueryName(message []byte) string {
 	return strings.TrimSuffix(strings.ToLower(question.Name.String()), ".")
 }
 
-func extractHTTPHost(payload []byte) string {
+func ExtractHTTPHost(payload []byte) string {
 	if len(payload) == 0 {
 		return ""
 	}
@@ -118,7 +118,7 @@ func extractHTTPHost(payload []byte) string {
 	return ""
 }
 
-func extractTLSServerName(payload []byte) string {
+func ExtractTLSServerName(payload []byte) string {
 	if len(payload) < 5 || payload[0] != 0x16 {
 		return ""
 	}

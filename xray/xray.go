@@ -25,8 +25,9 @@ import (
 )
 
 type XrayConfig struct {
-	Port  int
-	Users []string
+	Port           int
+	Users          []string
+	BlockedDomains []string
 }
 
 const xrayConfigTmpl = `
@@ -49,7 +50,16 @@ const xrayConfigTmpl = `
           "api"
         ],
         "outboundTag": "api"
-      }
+      }{{if .BlockedDomains}},
+      {
+        "type": "field",
+        "domain": [
+          {{range $i, $d := .BlockedDomains}}{{if $i}},{{end}}
+          "domain:{{$d}}"
+          {{end}}
+        ],
+        "outboundTag": "blocked"
+      }{{end}}
     ]
   },
   "policy": {
@@ -116,63 +126,158 @@ const xrayConfigTmpl = `
   ],
   "outbounds": [
     {
+      "tag": "direct",
       "protocol": "freedom"
-    }
+    }{{if .BlockedDomains}},
+    {
+      "tag": "blocked",
+      "protocol": "blackhole"
+    }{{end}}
   ]
 }
 `
 
-var (
-	cmd *exec.Cmd
-
-	trafficStatRe = regexp.MustCompile(`^user>>>(.+?)>>>traffic>>>(uplink|downlink)$`)
-	onlineStatRe  = regexp.MustCompile(`^user>>>(.+?)>>>(?:online|connection|connections)$`)
-)
-
 func SyncUsers(port int) {
-	var lastUsers []string
+	var (
+		lastUsers          []string
+		lastBlockedDomains []string
+	)
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		rows, err := db.FindMany(ctx, "subscriptions", voidorm.NewQuery().WhereNode(voidorm.QueryNode{
-			OR: []voidorm.QueryNode{
-				{Field: "isLifetime", Op: voidorm.Eq, Value: true},
-				{Field: "activeUntil", Op: voidorm.Gte, Value: time.Now().UTC()},
-			},
-		}))
-		cancel()
+		currentUsers, err := loadActiveUsers()
 		if err != nil {
 			log.Printf("[Xray] Subscription query error: %v", err)
 			time.Sleep(30 * time.Second)
 			continue
 		}
 
-		seen := make(map[string]struct{}, len(rows))
-		currentUsers := make([]string, 0, len(rows))
-		for _, row := range rows {
-			userID := db.AsString(row, "userId")
-			if userID == "" {
-				continue
-			}
-			if _, ok := seen[userID]; ok {
-				continue
-			}
-			seen[userID] = struct{}{}
-			currentUsers = append(currentUsers, userID)
+		currentBlockedDomains, err := loadBlockedDomains()
+		if err != nil {
+			log.Printf("[Xray] Blocklist query error: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
 		}
-		sort.Strings(currentUsers)
 
-		if !sameUsers(currentUsers, lastUsers) {
-			log.Printf("[Xray] Active users changed (%d total), reconfiguring Xray", len(currentUsers))
-			if err := restartXray(currentUsers, port); err != nil {
+		if !sameUsers(currentUsers, lastUsers) || !sameUsers(currentBlockedDomains, lastBlockedDomains) {
+			log.Printf(
+				"[Xray] Reconfiguring Xray: %d active user(s), %d blocked domain(s)",
+				len(currentUsers),
+				len(currentBlockedDomains),
+			)
+			if err := restartXray(currentUsers, currentBlockedDomains, port); err != nil {
 				log.Printf("[Xray] Failed to restart Xray: %v", err)
 			} else {
 				lastUsers = currentUsers
+				lastBlockedDomains = currentBlockedDomains
 			}
 		}
 
 		time.Sleep(30 * time.Second)
 	}
+}
+
+func loadActiveUsers() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	rows, err := db.FindMany(ctx, "subscriptions", voidorm.NewQuery().WhereNode(voidorm.QueryNode{
+		OR: []voidorm.QueryNode{
+			{Field: "isLifetime", Op: voidorm.Eq, Value: true},
+			{Field: "activeUntil", Op: voidorm.Gte, Value: time.Now().UTC()},
+		},
+	}))
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	currentUsers := make([]string, 0, len(rows))
+	for _, row := range rows {
+		userID := db.AsString(row, "userId")
+		if userID == "" {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		currentUsers = append(currentUsers, userID)
+	}
+	sort.Strings(currentUsers)
+	return currentUsers, nil
+}
+
+func loadBlockedDomains() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.FindMany(
+		ctx,
+		"vpn_blocked_domains",
+		voidorm.NewQuery().
+			Where("isActive", voidorm.Eq, true).
+			OrderBy("domain", voidorm.Asc),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	domains := make([]string, 0, len(rows))
+	for _, row := range rows {
+		domain := strings.ToLower(strings.Trim(strings.TrimSpace(db.AsString(row, "domain")), "."))
+		if domain == "" {
+			continue
+		}
+		if _, ok := seen[domain]; ok {
+			continue
+		}
+		seen[domain] = struct{}{}
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	return domains, nil
+}
+
+func restartXray(users []string, blockedDomains []string, port int) error {
+	tmpl, err := template.New("config").Parse(xrayConfigTmpl)
+	if err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, XrayConfig{
+		Port:           port,
+		Users:          users,
+		BlockedDomains: blockedDomains,
+	}); err != nil {
+		return err
+	}
+	if err := os.WriteFile("xray_config.json", buf.Bytes(), 0644); err != nil {
+		return err
+	}
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}
+
+	cmd = exec.Command("xray", "run", "-c", "xray_config.json")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go streamXrayOutput(stdout, false)
+	go streamXrayOutput(stderr, true)
+	log.Printf("[Xray] Started new xray process with PID %d", cmd.Process.Pid)
+	return nil
 }
 
 func StartStatsPoller() {
@@ -257,43 +362,12 @@ func sameUsers(left, right []string) bool {
 	return true
 }
 
-func restartXray(users []string, port int) error {
-	tmpl, err := template.New("config").Parse(xrayConfigTmpl)
-	if err != nil {
-		return err
-	}
+var (
+	cmd *exec.Cmd
 
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, XrayConfig{Port: port, Users: users}); err != nil {
-		return err
-	}
-	if err := os.WriteFile("xray_config.json", buf.Bytes(), 0644); err != nil {
-		return err
-	}
-
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}
-
-	cmd = exec.Command("xray", "run", "-c", "xray_config.json")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	go streamXrayOutput(stdout, false)
-	go streamXrayOutput(stderr, true)
-	log.Printf("[Xray] Started new xray process with PID %d", cmd.Process.Pid)
-	return nil
-}
+	trafficStatRe = regexp.MustCompile(`^user>>>(.+?)>>>traffic>>>(uplink|downlink)$`)
+	onlineStatRe  = regexp.MustCompile(`^user>>>(.+?)>>>(?:online|connection|connections)$`)
+)
 
 type statsResponse struct {
 	Stat []statsItem `json:"stat"`
