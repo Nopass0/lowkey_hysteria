@@ -16,8 +16,6 @@ step()  { echo -e "\n${CYAN}== $* ==${NC}"; }
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$REPO_DIR/hysteria_server"
 ENV_FILE="$REPO_DIR/.env"
-PM2_APP_NAME="${PM2_APP_NAME:-lowkey-vpn}"
-PM2_MTPROTO_NAME="${PM2_APP_NAME}-mtproto"
 GO_MIN="1.21"
 
 step "Checking Go installation"
@@ -141,6 +139,10 @@ if [[ ! -f "$ENV_FILE" ]]; then
 else
     info "Using $ENV_FILE"
 fi
+
+ENV_PM2_APP_NAME=$(grep -E '^PM2_APP_NAME=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
+PM2_APP_NAME="${PM2_APP_NAME:-${ENV_PM2_APP_NAME:-lowkey-vpn}}"
+PM2_MTPROTO_NAME="${PM2_APP_NAME}-mtproto"
 
 LISTEN_PORT=$(grep -E '^LISTEN_ADDR' "$ENV_FILE" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "7000")
 HTTP_PORT=$(grep -E '^HTTP_ADDR' "$ENV_FILE" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || echo "8080")
