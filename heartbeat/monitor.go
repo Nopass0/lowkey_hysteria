@@ -46,6 +46,9 @@ func shouldRefreshConnectLink(existing, generated, connectHost string) bool {
 	if strings.Contains(existing, "security=reality") && !strings.Contains(existing, "flow=xtls-rprx-vision") {
 		return true
 	}
+	if strings.Contains(existing, "security=reality") && !strings.Contains(existing, "packetEncoding=xudp") {
+		return true
+	}
 	if !strings.Contains(existing, "pbk=") || !strings.Contains(existing, "sid=") {
 		return true
 	}
@@ -58,7 +61,7 @@ func RegisterServer(cfg *config.Config, location string) {
 	if connectHost == "" {
 		connectHost = cfg.PublicIP
 	}
-	connectLink := "vless://{uuid}@" + connectHost + ":" + strconv.Itoa(cfg.XrayPort) + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=google.com&fp=chrome&pbk=4kh0XQFo3wcPOnAU-o_Nokc3WQGWUVQEPQBurWHxUBM&sid=e12b6c973e573780&type=tcp&headerType=none#lowkey-" + location
+	connectLink := "vless://{uuid}@" + connectHost + ":" + strconv.Itoa(cfg.XrayPort) + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=google.com&fp=chrome&pbk=4kh0XQFo3wcPOnAU-o_Nokc3WQGWUVQEPQBurWHxUBM&sid=e12b6c973e573780&type=tcp&headerType=none&packetEncoding=xudp#lowkey-" + location
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -72,11 +75,11 @@ func RegisterServer(cfg *config.Config, location string) {
 		if err == nil {
 			id := db.AsString(doc, "_id")
 			patch := voidorm.Doc{
-				"status":              "online",
-				"currentLoad":         telemetry.TotalLoad(),
-				"location":            location,
-				"supportedProtocols":  protocols,
-				"lastSeenAt":          time.Now().UTC(),
+				"status":             "online",
+				"currentLoad":        telemetry.TotalLoad(),
+				"location":           location,
+				"supportedProtocols": protocols,
+				"lastSeenAt":         time.Now().UTC(),
 			}
 			if cfg.PublicHostname != "" {
 				patch["hostname"] = cfg.PublicHostname
