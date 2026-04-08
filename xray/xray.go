@@ -91,8 +91,7 @@ const xrayConfigTmpl = `
           {
             "id": "{{$u}}",
             "email": "{{$u}}",
-            "level": 0,
-            "flow": "xtls-rprx-vision"
+            "level": 0
           }
           {{end}}
         ],
