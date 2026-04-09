@@ -122,6 +122,47 @@ const xrayConfigTmpl = `
           ]
         }
       }
+    },
+    {
+      "tag": "vless-android",
+      "port": 8444,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {{range $i, $u := .Users}}{{if $i}},{{end}}
+          {
+            "id": "{{$u}}",
+            "email": "{{$u}}",
+            "level": 0
+          }
+          {{end}}
+        ],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "google.com:443",
+          "xver": 0,
+          "serverNames": [
+            "google.com"
+          ],
+          "privateKey": "97tkV3UQpZrSOQ2fPe1ZDGUc7Ew7Azibfkgtzc46To0",
+          "shortIds": [
+            "e12b6c973e573780"
+          ]
+        }
+      }
     }
   ],
   "outbounds": [
